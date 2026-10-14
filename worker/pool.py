@@ -1,26 +1,13 @@
-# worker/pool.py
-# Coordinator + multiprocessing worker pool.
-
-# Design decisions (good interview material):
-#   * multiprocessing.Process (not threads): true parallelism for the GIL-
-#     bounded interpreter, and a worker that dies (segfault, OOM) is isolated
-#     -- the pool notices and respawns rather than killing the API.
-#   * Each worker is a daemonless child that loops claim -> run -> store.
-#     The coordinator supervises, replacing any worker that vanished.
-#   * 'spawn' start method (default on Windows/macOS): each worker gets a
-#     *fresh* process, so a worker that messes with its own imports cannot
-#     poison the API process.
-#   * Polling: claim_next() uses SQLite's atomic UPDATE, so two workers can
-#     never claim the same row (see database._claim_ready).
-#   * On coordinator shutdown, workers exit cleanly via an Event.
-
+"""Supervised workers with live leases, crash recovery and graceful shutdown."""
 from __future__ import annotations
 
 import logging
 import multiprocessing as mp
 import os
+import signal
+import threading
 import time
-from typing import Optional
+import uuid
 
 import config
 import database
@@ -29,137 +16,116 @@ import sandbox
 log = logging.getLogger("sandbox.worker")
 
 
-# ---------------------------------------------------------------------------
-# Worker main loop (runs in its own process).
-# ---------------------------------------------------------------------------
+def _worker_loop(stop_event, name):
+    config.validate()
+    heartbeat_stop = threading.Event()
 
-def _worker_loop(
-    stop_event: mp.sync.Event,
-    poll_interval: float,
-    timeout: float,
-    cpu_seconds: float,
-    mem_mb: int,
-) -> None:
-    """Endless claim->execute->persist loop for one child process."""
-    name = f"worker-{os.getpid()}"
-    log.info("%s started", name)
+    def keep_lease():
+        while not heartbeat_stop.wait(config.WORKER_HEARTBEAT_SECONDS):
+            try:
+                database.heartbeat(name)
+            except Exception:
+                log.exception("Worker heartbeat failed")
 
-    while not stop_event.is_set():
-        job = database.claim_next(name)
-        if job is None:
-            stop_event.wait(poll_interval)  # idle sleep == polite poll rate
-            continue
+    database.heartbeat(name)
+    lease = threading.Thread(target=keep_lease, daemon=True)
+    lease.start()
+    try:
+        while not stop_event.is_set():
+            parent = mp.parent_process()
+            if parent is not None and not parent.is_alive():
+                break
+            job = database.claim_next(name)
+            if job is None:
+                stop_event.wait(config.POLL_INTERVAL)
+                continue
+            try:
+                result = sandbox.run_code(job["language"], job["code"], stdin=job.get("stdin") or "",
+                                          timeout=config.TIMEOUT_SECONDS, cpu_seconds=config.CPU_SECONDS, mem_mb=config.MEM_MB)
+                database.store_result(job["id"], result, worker_name=name)
+            except Exception:
+                log.exception("Execution failed id=%s", job["id"])
+                database.mark_failed(job["id"], "Execution infrastructure failed", worker_name=name)
+    finally:
+        heartbeat_stop.set()
+        lease.join(timeout=config.SQLITE_TIMEOUT + 1)
+        database.expire_worker(name)
 
-        log.info("%s running %s (%s)", name, job["id"], job["language"])
-        try:
-            result = sandbox.run_code(
-                job["language"],
-                job["code"],
-                stdin=job.get("stdin") or "",
-                timeout=timeout,
-                cpu_seconds=cpu_seconds,
-                mem_mb=mem_mb,
-            )
-        except Exception as exc:  # engine failure (not user failure)
-            log.exception("%s engine error for %s", name, job["id"])
-            database.mark_failed(job["id"], f"engine error: {exc}")
-            continue
-
-        database.store_result(job["id"], result)
-        log.info("%s finished %s in %.3fs", name, job["id"], result.get("wall_time") or 0)
-
-    log.info("%s stopping", name)
-
-
-# ---------------------------------------------------------------------------
-# Coordinating pool.
-# ---------------------------------------------------------------------------
 
 class WorkerPool:
-    """Supervises `max_workers` child processes executing queued submissions."""
+    def __init__(self, max_workers=None):
+        self.max_workers = config.MAX_WORKERS if max_workers is None else max_workers
+        if self.max_workers < 1:
+            raise ValueError("At least one worker is required")
+        self._ctx = mp.get_context("spawn")
+        self._stop = self._ctx.Event()
+        self._procs = []
+        self._names = {}
+        self._last_maintenance = 0
 
-    def __init__(self, max_workers: Optional[int] = None) -> None:
-        self.max_workers = max_workers or config.MAX_WORKERS
-        self._stop = mp.Event()
-        self._procs: list[mp.Process] = []
+    def _spawn(self):
+        name = f"worker-{uuid.uuid4().hex}"
+        process = self._ctx.Process(target=_worker_loop, args=(self._stop, name), name=name)
+        process.start()
+        self._procs.append(process)
+        self._names[process.pid] = name
 
-    # -- lifecycle ----------------------------------------------------------
-
-    def start(self) -> None:
-        """(Re)fill the pool with as many workers as configured."""
-        ctx = mp.get_context("spawn")
-        for _ in range(self.max_workers):
-            p = ctx.Process(
-                target=_worker_loop,
-                args=(
-                    self._stop,
-                    config.POLL_INTERVAL,
-                    config.TIMEOUT_SECONDS,
-                    config.CPU_SECONDS,
-                    config.MEM_MB,
-                ),
-                daemon=False,
-                name=f"worker-{len(self._procs)}",
-            )
-            p.start()
-            self._procs.append(p)
-        log.info("pool started with %d workers", self.max_workers)
-
-    def stop(self, timeout: float = 10.0) -> None:
-        """Signal workers to stop and join them (bounded wait)."""
-        self._stop.set()
-        for p in self._procs:
-            p.join(timeout=timeout)
-            if p.is_alive():
-                p.terminate()
-                p.join(5)
-        log.info("pool stopped")
-
-    # -- supervision --------------------------------------------------------
-
-    def watch(self) -> None:
-        """Replace any worker that died unexpectedly (crash/segfault)."""
-        if all(p.is_alive() for p in self._procs):
+    def start(self):
+        config.validate()
+        if self._procs:
             return
-        dead = self.max_workers - sum(1 for p in self._procs if p.is_alive())
-        log.warning("respawn %d crashed worker(s)", dead)
-        # Drop stale references, keeping only living workers.
-        self._procs = [p for p in self._procs if p.is_alive()]
-        ctx = mp.get_context("spawn")
-        for _ in range(dead):
-            p = ctx.Process(
-                target=_worker_loop,
-                args=(
-                    self._stop,
-                    config.POLL_INTERVAL,
-                    config.TIMEOUT_SECONDS,
-                    config.CPU_SECONDS,
-                    config.MEM_MB,
-                ),
-                daemon=False,
-            )
-            p.start()
-            self._procs.append(p)
+        self._stop.clear()
+        # Docker readiness is checked before advertising workers as available.
+        if config.SANDBOX_BACKEND == "docker":
+            from sandbox.runtime import check_backend
+            check_backend()
+        database.requeue_stuck()
+        for _ in range(self.max_workers):
+            self._spawn()
 
-    def alive_count(self) -> int:
-        return sum(1 for p in self._procs if p.is_alive())
+    def stop(self, timeout=None):
+        self._stop.set()
+        # Allow container startup/compile/execution/cleanup to finish normally.
+        deadline = time.monotonic() + (config.TIMEOUT_SECONDS + 50 if timeout is None else timeout)
+        for process in self._procs:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            database.expire_worker(self._names[process.pid])
+        self._procs.clear()
+        database.requeue_stuck()
+
+    def watch(self):
+        if self._stop.is_set():
+            return
+        for process in list(self._procs):
+            if not process.is_alive():
+                process.join()
+                database.expire_worker(self._names.pop(process.pid))
+                self._procs.remove(process)
+        database.requeue_stuck()
+        while len(self._procs) < self.max_workers:
+            self._spawn()
+        if time.monotonic() - self._last_maintenance > 30:
+            database.prune_results()
+            self._last_maintenance = time.monotonic()
+
+    def alive_count(self):
+        return sum(process.is_alive() for process in self._procs)
 
 
-def run_forever(max_workers: Optional[int] = None) -> None:
-    """Entry point for `python -m worker.pool`."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s[%(process)d] %(levelname)s %(message)s",
-    )
-    database.requeue_stuck()  # pick up rows orphaned by a previous crash
+def run_forever(max_workers=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    shutdown = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: shutdown.set())
     pool = WorkerPool(max_workers)
     pool.start()
     try:
-        while True:
+        while not shutdown.wait(1):
             pool.watch()
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        log.info("shutting down pool")
+    finally:
         pool.stop()
 
 

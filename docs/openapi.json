@@ -1,0 +1,105 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CodeForge Execution API",
+    "version": "1.0.0",
+    "description": "Single-operator execution engine. Bearer authentication is optional in local development and mandatory in production. Token holders share history. Completed means execution finished; inspect exit_code for success. Byte limits are reported by /api/config."
+  },
+  "servers": [{"url": "/"}],
+  "components": {
+    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
+    "schemas": {
+      "Error": {"type": "object", "properties": {"error": {"type": "string"}}},
+      "Submission": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "language": {"type": "string"},
+          "status": {"enum": ["queued", "running", "completed", "failed"]},
+          "submitted_at": {"type": "number"}
+        }
+      },
+      "Result": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"enum": ["completed", "failed"]},
+          "stdout": {"type": "string"},
+          "stderr": {"type": "string"},
+          "exit_code": {"type": "integer"},
+          "wall_time": {"type": ["number", "null"]},
+          "resource_usage": {
+            "type": "object",
+            "properties": {
+              "wall_time": {"type": ["number", "null"]},
+              "timed_out": {"type": "boolean"},
+              "output_truncated": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [{"bearerAuth": []}],
+  "paths": {
+    "/health": {"get": {"summary": "Liveness and configured capabilities", "security": [], "responses": {"200": {"description": "API process is alive"}}}},
+    "/ready": {"get": {"summary": "Database availability and live worker heartbeats", "security": [], "responses": {"200": {"description": "Workers ready; includes queued and running counts"}, "503": {"description": "Database or workers unavailable"}}}},
+    "/api/config": {"get": {"summary": "Public limits, languages, backend and authentication requirement", "security": [], "responses": {"200": {"description": "Public configuration; no tokens or filesystem paths"}}}},
+    "/submit": {
+      "post": {
+        "summary": "Queue source code for execution",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {
+            "schema": {
+              "type": "object", "required": ["language", "source"],
+              "properties": {
+                "language": {"enum": ["python", "c"]},
+                "source": {"type": "string", "minLength": 1},
+                "stdin": {"type": "string", "default": ""}
+              }
+            },
+            "example": {"language": "python", "source": "print(input().upper())", "stdin": "hello"}
+          }}
+        },
+        "responses": {
+          "201": {"description": "Queued; Location header points to status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Submission"}}}},
+          "400": {"description": "Invalid fields or JSON"},
+          "401": {"description": "Missing or invalid token"},
+          "413": {"description": "Source, stdin or body exceeds byte limit"},
+          "415": {"description": "Expected JSON content type"},
+          "429": {"description": "Queue full; retry after Retry-After seconds"},
+          "503": {"description": "Database unavailable or production workers offline"}
+        }
+      }
+    },
+    "/status/{submission_id}": {
+      "get": {
+        "summary": "Read submission lifecycle state",
+        "parameters": [{"name": "submission_id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {
+          "200": {"description": "Current state", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Submission"}}}},
+          "401": {"description": "Invalid token"}, "404": {"description": "Unknown or expired submission"}
+        }
+      }
+    },
+    "/result/{submission_id}": {
+      "get": {
+        "summary": "Read output, exit code and resource diagnostics",
+        "parameters": [{"name": "submission_id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {
+          "200": {"description": "Finished result", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Result"}}}},
+          "401": {"description": "Invalid token"}, "404": {"description": "Unknown or expired submission"},
+          "409": {"description": "Execution not finished; retry after Retry-After seconds"}
+        }
+      }
+    },
+    "/submissions": {
+      "get": {
+        "summary": "Recent submissions, newest first",
+        "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100}}],
+        "responses": {"200": {"description": "Object containing submissions array"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Invalid token"}}
+      }
+    }
+  }
+}

@@ -1,286 +1,172 @@
-# Sandboxed Code Execution Engine
+# CodeForge · Sandboxed Code Execution Engine
 
-A backend service that safely executes **untrusted student/AI-snippet code**
-(Python and C) with a REST API, a multiprocessing worker pool, SQLite
-persistence, and a defence-in-depth isolation layer — the same shape as the
-things powering HackerRank / LeetCode / CI runners. Written for clarity so
-every design decision is explainable in an interview.
+A local-first code execution studio for Python and C: edit a program, supply stdin, run test cases, and inspect durable results. Built with Flask, a supervised multiprocessing pool, SQLite and an optional Docker execution backend.
 
----
+**For a portfolio demo:** start the app, open Two Sum, and click **Submit All**. The editor, queue, real worker processes, resource limits, results and history all run on your machine. See the [five-minute interview walkthrough](docs/DEMO.md).
 
-## Quick start
+![CodeForge running all Two Sum test cases](docs/demo.png)
 
-```bash
-# 1. create a venv and install dependencies
+## Start the local demo
+
+Requires **Python 3.11+**. A C compiler (`gcc`, `cc` or `clang`) is optional for local C execution. Python examples work without one. Node is only needed for frontend example tests, not to run the app.
+
+```powershell
+# Windows — installs dependencies into .venv and starts the application
+.\scripts\start.ps1
+```
+
+Or use the same commands on any platform:
+
+```sh
 python -m venv .venv
-.\.venv\Scripts\activate        # POSIX: source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2. run the API + worker pool together (dev mode)
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
 python run.py
+```
 
-# 3. or run them as separate processes (readier for prod)
-python -m api.app               # terminal 1 : REST API on http://127.0.0.1:5000
-python -m worker.pool           # terminal 2 : worker pool
+Open **http://127.0.0.1:5000**. Press Ctrl+C to stop. Use `python run.py --port 5055 --workers 2` to change the port or worker count. The default process backend is **for trusted local code only** and the launcher binds to loopback.
 
-# 4. exercise the API (or run the self-contained demo)
+Monaco supplies syntax highlighting, shortcuts and editor tooling when its CDN is available. An editable plain-text fallback starts immediately and preserves edits when Monaco finishes loading. Fonts also have local fallbacks. Drafts are saved per problem and language in this browser; results live in SQLite.
+
+## What the project demonstrates
+
+- **End-to-end execution:** Python/C, stdin, multiple test cases, exit codes, stderr, measured wall time and submission history.
+- **A durable queue:** atomic capacity checks and claims; SQLite WAL with connections closed after every operation.
+- **Fault recovery:** supervised workers, independent heartbeat threads, expired-lease recovery and ownership-checked result writes.
+- **Bounded workloads:** wall time, memory limits, process-tree cleanup, source/input limits, and a combined stdout/stderr budget enforced while reading pipes.
+- **An explicit deployment boundary:** Docker per submission, bearer token authentication, production configuration validation, readiness checks, a WSGI server and Compose packaging.
+- **Reviewable engineering:** API contract, security regression tests, concurrent queue tests, real HTTP smoke checks, browser starter-program tests, and Windows/Linux CI.
+
+The UI reports actual execution data. Peak memory is not measured and no synthetic memory number is displayed.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[Browser studio] -->|JSON /submit| API[Flask + Waitress]
+    API --> DB[(SQLite WAL queue)]
+    POOL[Worker supervisor] --> W[Execution workers]
+    W -->|atomic claim + lease| DB
+    W --> RUN[Fresh process or Docker container]
+    RUN -->|bounded output + exit code| W
+    W -->|ownership-checked result| DB
+    UI -->|poll /status and /result| API
+```
+
+The API never evaluates submitted code. `queued → running → completed` records an execution attempt; a non-zero exit code can still have status `completed`. `failed` denotes an engine error. Always inspect `exit_code`, `resource_usage.timed_out` and `resource_usage.output_truncated`.
+
+Claims are exclusive while a lease is valid. Recovery is **at-least-once**, not exactly-once: a job can run again after a crash or expired lease. Writes from a previous owner cannot replace the current owner's result. Live workers are never blindly requeued on another pool's startup.
+
+## API
+
+The machine-readable contract is [docs/openapi.json](docs/openapi.json), also served at `/openapi.json`.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /submit` | `{language, source, stdin?}` → `201` with ID and links |
+| `GET /status/<id>` | Lifecycle state and submission time |
+| `GET /result/<id>` | Output, exit code and resource usage; `409` while pending |
+| `GET /submissions?limit=20` | Latest submissions, newest first |
+| `GET /health` | API liveness and configured capabilities |
+| `GET /ready` | Database and worker heartbeat readiness; `503` when unavailable |
+| `GET /api/config` | Public limits, languages and authentication requirement |
+
+```sh
 curl -X POST http://127.0.0.1:5000/submit \
-     -H "Content-Type: application/json" \
-     -d "{\"language\":\"python\",\"source\":\"print('hi')\",\"stdin\":\"\"}"
-curl http://127.0.0.1:5000/status/<id>
-curl http://127.0.0.1:5000/result/<id>
-python examples/demo.py         # push all examples through a real pool
+  -H 'Content-Type: application/json' \
+  -d '{"language":"python","source":"print(input().upper())","stdin":"hello"}'
 ```
 
-All config lives in `config.py` and is overridable per key via environment
-variable or `config.json` (`MAX_WORKERS`, `TIMEOUT_SECONDS`, `CPU_SECONDS`,
-`MEM_MB`, `DB_PATH`, …).
+Source and stdin limits count UTF-8 bytes. Invalid fields return `400`, incorrect content type `415`, oversized input `413`, and a full queue `429` with `Retry-After`. Responses carry `X-Request-ID`. Authenticated endpoints require `Authorization: Bearer <API_TOKEN>` whenever a token is configured. The browser's **Access** dialog stores it only in the current tab's session. All token holders share one history; this is a single-operator service, not a multi-user account system.
 
----
+## Docker deployment path
 
-## REST API
+Requires Docker with Linux containers and Compose. Build the runner explicitly; submissions never trigger image downloads or silently fall back to the host process backend.
 
-| Endpoint | Method | Body / Params | Returns |
-|---|---|---|---|
-| `/submit` | POST | `{"language": "python\|c", "source": "...", "stdin": "..."}` | `201 {id, status, _links}` |
-| `/status/<id>` | GET | — | `{id, language, status, submitted_at}` |
-| `/result/<id>` | GET | — | `{id, status, stdout, stderr, exit_code, wall_time}` |
-| `/submissions` | GET | `?limit=` | latest rows, newest first |
-| `/health` | GET | — | liveness + live sandbox capability report |
+```sh
+cp .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"
+# Paste the generated token into API_TOKEN in .env.
+# On Linux, set DOCKER_GID to: stat -c '%g' /var/run/docker.sock
 
-`status` is exactly one of **`queued` → `running` → `completed` | `failed`**.
-`/result/<id>` returns `409` until execution is finished, `404` for unknown
-ids. Lifecycle:
-
-```text
-client ──POST /submit──▶ submission(id=queued) ──▶ SQLite (shared queue)
-        ◀─201 + id──                         │
-                                             ▼
-                        worker pool (N processes, claim-next = atomic UPDATE
-                        ... RETURNING)  ──▶ sandbox.run_code ──▶ result
-                                             │
-client ──GET /status/id──────────────▶ status  ▼
-client ──GET /result/id──────────────▶ stdout/stderr/exit_code/wall_time
+docker build -f sandbox/Dockerfile -t codeforge-sandbox:local .
+docker compose up --build -d
+docker compose ps
+curl http://127.0.0.1:5000/ready
 ```
 
----
+On Windows, use `Copy-Item .env.example .env`. Docker Desktop must use Linux containers. Open the same UI and enter your token through **Access**. Compose binds port 5000 to loopback; this is suitable for a local deployment demonstration. For a remote deployment, place an authenticated HTTPS reverse proxy in front, configure network exposure deliberately, and run the worker on a dedicated host.
 
-## The isolation model (defence in depth)
+Each submission gets a non-root container with no network, a read-only root filesystem, dropped capabilities, no-new-privileges, PID/memory/CPU limits, bounded scratch tmpfs and no host mounts. Compilation also happens inside this container. The worker mounts the Docker socket; the API and submission containers do not. **Docker socket access is powerful host access**: treat the worker as privileged infrastructure, use a dedicated machine, and consider rootless Docker with working cgroup limits. Docker shares a kernel; a public hostile multi-tenant judge needs further hardening (for example gVisor or microVMs), per-user quotas and ownership.
 
-Each submission is executed as a **separate child process** (`subprocess`),
-behind the following independent layers. Layers 1–3 are *cheap and language
-specific*; layers 4–6 are the *real* process sandbox that applies to any
-runtime.
+`/ready` reports live workers, not a continuous Docker daemon probe. Workers verify the daemon and runner image at startup; later daemon failures appear as failed execution results. The container has its own lifetime alarm and automatic removal, plus worker-side cleanup.
 
-### Layer 1 — Static pre-checks (`sandbox/prechecks.py`)
-Before a submission is ever scheduled, its source text is scanned for
-blocklist patterns (`os.system`, `subprocess`, `socket`, `eval(`, `open(`,
-`__import__`, `getattr`, `fork`, `system(`, …). Matches are rejected with a
-clear message. **This is a convenience filter, not a security boundary** —
-string scanning is trivially obfuscatable.
-
-### Layer 2 — Python runtime guard (`sandbox/runtime.py` → generated `runner.py`)
-The child interpreter boots through a **bootstrap runner** that:
-1. **Preloads a curated stdlib prefix** (`math`, `random`, `json`, `re`,
-   `collections`, …). Because these load *before* the guard, their benign
-   internal `import os` / `import sys` calls still work.
-2. **Strips dangerous attributes** from the resident `os` module
-   (`os.system`, `os.popen`, `os.fork`, `os.exec*`, `os.kill`, …) — so even a
-   guard bypass can't reach the classic escape hatches.
-3. **Installs a guarded `__import__`**: any *user* import whose root module
-   is on a forbid-list (`os`, `subprocess`, `socket`, `sys`, `ctypes`,
-   `pathlib`, `threading`, `multiprocessing`, `pickle`, `importlib`, …)
-   raises `ImportError` **at runtime**, independent of source text.
-4. **Shrinks builtins** to a minimal algorithmic subset — `open`, `eval`,
-   `exec`, `getattr`, `dir`, `vars`, `compile`, `__import__` (exposed only as
-   the guarded version) are simply not there.
-
-The submission is executed with `exec(compile(...))` in a fresh namespace,
-by an interpreter launched as `python -S -I -E -B` (no site, fully isolated,
-no `.pyc`, no `PYTHON*` env influence).
-
-### Layer 3 — C compile gates (`_compile_c`)
-C is dangerous the other way: source is mostly safe until the *links* happen.
-We compile every submission with
-`gcc -std=c11 -Wall -Wextra -Werror -fno-builtin -fPIE -pie`. In C11 an
-implicit function declaration is a **hard compile error**, so a submission
-calling `system()`, `fork()`, `exec*()`, `socket()`, … fails at compile time
-— the compiler is the authoritative static filter. The light text scan in
-layer 1 just saves the compile cycle for obvious cases. (No compiler on
-PATH → the submission degrades to a clean `failed` result, never a crash.)
-
-### Layer 4 — Process jail (`sandbox/runtime.py → run_command`)
-* **Fresh empty workdir**: every run creates a brand-new `tempfile.mkdtemp()`
-  directory, chdirs into it, and deletes it afterwards. The submission has no
-  window on the repo, the DB, or any sibling file.
-* **Stripped environment**: the child gets `PATH`, `LANG`, `LC_ALL`,
-  `TMPDIR` (and Windows system plumbing) — **nothing else**. Host secrets
-  (API keys, config, CI tokens) simply don't exist in its `os.environ`.
-* **Pipes, not temp files**: stdin/stdout/stderr travel through anonymous
-  pipe descriptors; the child never holds a persistent file handle.
-* **POSIX rlimits set in `preexec_fn`** (before `exec`, so inherited by the
-  runtime and anything it could spawn):
-  - `RLIMIT_CPU` — hard CPU-seconds budget (→ `SIGXCPU` on overrun);
-  - `RLIMIT_AS` — hard address-space / memory cap in MB (→ `MemoryError`);
-  - `RLIMIT_NPROC` — fork-bomb guard (no child processes);
-  - `os.setsid()` — a fresh session/process group so grandchildren can be
-    killed as a group.
-  On `win32` `resource` doesn't exist, so these degrade gracefully to the
-  watchdog (see Platform notes).
-
-### Layer 5 — Wall-clock watchdog + process-tree kill
-`run_command` blocks on `proc.communicate(stdin, timeout=…)`; on timeout it
-kills **the whole process group** (`os.killpg(..., SIGKILL)`) or the process
-on Windows, and reaps it. A **daemon watchdog thread** independently enforces
-`deadline = now + timeout + 1s` and group-kills if the main thread is ever
-wedged — for example on an uninterruptible syscall that swallows the Python
-level timeout. A program that spins forever, forks a tree, or writes
-unbounded output cannot outlive `wall_time ≤ timeout + ~1s`.
-
-### Layer 6 — One submission, one process, one temporary world
-Everything above composes into: **untrusted code runs once, in a fresh,
-empty, secret-free directory, under hard CPU/memory/time caps, in a process
-that is guaranteed to be killed and reaped.** Results are captured and
-persisted; the scratch directory and pipes are destroyed.
-
----
-
-## Concurrency & persistence
-
-* **Worker pool** (`worker/pool.py`): `multiprocessing` `spawn` children
-  (fresh interpreters; a crashed worker — segfault, native OOM — is isolated
-  and **respawned** by a supervision loop). Each worker loops
-  `claim → execute → store`. Max concurrency = `MAX_WORKERS`.
-* **Atomic claims, exactly-once**: relying on SQLite as the shared work
-  queue, `claim_next` is a single
-  `UPDATE … WHERE id=(SELECT oldest queued …) RETURNING …` — two workers can
-  never pick the same row (`codahale`s “take a lock by mutating state”).
-* **Crash recovery**: `database.requeue_stuck()` marks `running` rows left
-  by a dead pool back to `queued` at startup.
-* **WAL mode**: readers (API) never block writers (workers); each call gets a
-  short-lived connection.
-
----
-
-## Project layout
-
-```text
-api/           Flask routes (submit/status/result/health), no logic of its own
-sandbox/       THE isolation layer: prechecks.py, runtime.py, core.py
-worker/        sync coordinator + multiprocessing pool (pool.py)
-tests/         db tests, sandbox security suite, end-to-end API integration
-examples/      3 safe + 4 malicious submissions, plus a self-contained demo
-config.py      env/config.json overridable settings
-database.py    SQLite access layer (schema, claims, results)
-run.py         dev launcher (API + pool in one command)
-submissions.db created at runtime (gitignored)
+```sh
+docker compose logs -f api worker
+docker compose down           # preserves the named database volume
+# Explicit data deletion: docker compose down --volumes
 ```
 
----
+SQLite is a deliberate **single-host** choice. Use a local disk/volume, not an NFS share. Back up with SQLite's backup API or stop both services before copying the database and its WAL files. Retention removes finished rows after 24 hours; freed pages are reused. It does not immediately shrink the database file.
 
-## Security test suite
+## Configuration
 
-```bash
+Precedence: environment variables, optional `config.json`, then defaults. `.env` is read by Compose only; `python run.py` uses your shell environment or `config.json`. Tokens and local database files are ignored by Git and excluded from Docker builds.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `APP_ENV` | `development` | `production` requires Docker and a token |
+| `SANDBOX_BACKEND` | `process` | `process` for trusted demos; `docker` for OS isolation |
+| `SANDBOX_IMAGE` | `codeforge-sandbox:local` | Prebuilt Linux runner image |
+| `API_TOKEN` | empty | Production requires at least 32 ASCII characters; generate randomly |
+| `MAX_WORKERS` | `4` | Parallel execution workers |
+| `TIMEOUT_SECONDS` | `2` | Program wall-clock timeout |
+| `CPU_SECONDS` | `2` | POSIX CPU budget; Windows uses wall time |
+| `MEM_MB` | `256` | Address-space/Job Object/container memory budget |
+| `MAX_CODE_BYTES` | `1048576` | Source size |
+| `MAX_STDIN_BYTES` | `65536` | stdin size |
+| `MAX_RESULT_BYTES` | `4194304` | Combined stdout/stderr budget |
+| `MAX_PENDING_JOBS` | `100` | Queued plus running capacity |
+| `WORKER_HEARTBEAT_SECONDS` | `2` | Worker lease renewal interval |
+| `WORKER_STALE_SECONDS` | `60` | Expiry threshold; must exceed 3 heartbeat intervals |
+| `RESULT_RETENTION_SECONDS` | `86400` | Finished-history retention |
+| `DB_PATH` | project `submissions.db` | Shared API/worker SQLite location |
+| `POLL_INTERVAL` | `0.2` | Idle queue polling interval |
+| `SQLITE_TIMEOUT` | `10` | Database lock wait |
+
+C compilation has an additional 10-second budget. Docker startup and cleanup add overhead beyond the measured program wall time. Windows Job Objects cap memory and clean up descendants; they do not isolate filesystem or network access. Python source filters and compiler warnings are convenience checks, **not security boundaries**. Local process mode cannot safely accept arbitrary internet submissions.
+
+## Validation
+
+```sh
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
+node --check frontend/js/app.js
+python scripts/smoke.py               # requires a running app
+# alternate port: python scripts/smoke.py --url http://127.0.0.1:5055
 ```
 
-`tests/test_sandbox_security.py` is the security suite. Every attack below
-has a passing test that proves the sandbox catches it **cleanly** (process
-killed and reaped, submission marked completed/failed, host unaffected):
+Tests use temporary databases. Browser examples are extracted with Node and their exact programs are executed against their shipped test cases. Local C checks skip when no compiler exists. Docker tests are opt-in:
 
-| Attack in the suite | Layer that catches it |
-|---|---|
-| Fork-bomb (`os.fork`, `multiprocessing`) | static scan + guarded import + `RLIMIT_NPROC` + kill-tree |
-| Infinite loop | wall-clock watchdog (`timed_out=True`) |
-| Busy-write that wedges the pipe | watchdog (not just Python timeout) |
-| Read `/etc/passwd`, `os.walk('/')`, `shutil.copy`, `pathlib` | guarded import + `open` removed |
-| Read project files (`config.py` beside the sandbox) | fresh isolated workdir |
-| Env-var exfiltration | `clean_env()` stripping |
-| `subprocess.run/Popen`, `os.system`, `os.popen`, `pty.spawn`, `ctypes.CDLL` | static scan + guarded import |
-| ≥GB memory allocation | `RLIMIT_AS` → `MemoryError` (POSIX), watchdog bound (win32) |
-| `__import__('os')`, `getattr(...,'system')`, `__builtins__` reach-arounds | guarded `__import__` + shrunk builtins |
-| C `system("ls")` | static scan + `-Werror` implicit-declaration compile error |
+```sh
+RUN_DOCKER_TESTS=1 python -m pytest -q tests/test_docker_integration.py
+# PowerShell: $env:RUN_DOCKER_TESTS='1'; python -m pytest -q tests/test_docker_integration.py
+```
 
-`tests/test_api_integration.py` runs the full lifecycle over the real worker
-pool + SQLite with Flask's test client (10 concurrent jobs → all complete).
+CI runs the regular suite on Windows/Linux with Python 3.11/3.12, checks JavaScript syntax, builds the application and runner images, and runs the Docker integration tests on Linux. A configured workflow is not evidence that a remote CI run has passed.
 
----
+## Layout
 
-## Honest limitations (read this — it's the interview part)
-
-**This is a userspace process sandbox, not a container or VM.** Sequences
-someone determined can still attempt:
-
-1. **Native syscalls that rlimits don't tax.** `RLIMIT_CPU` counts CPU time but
-   not, e.g., I/O-loops or `time.sleep`; a busy `open()` loop eats wall time,
-   not CPU. The wall-clock watchdog bounds the *duration* but not the *work*.
-2. **File access via allowed modules.** Whitelisted stdlib modules are real
-   code; `import math` can't `open()`, but any bug in the python runtime or
-   the guest /kernel/ can be exploited. We strip the headline primitives
-   (`os.system`, …) but not every possible gadget.
-3. **C is link-restricted, not syscall-restricted.** A C program that gets a
-   libc `open`-equivalent via allowed headers (e.g. defining `_GNU_SOURCE`)
-   is running with *unrestricted host privileges* for that child. Compile
-   gates reject the obvious `system`/`fork`/`exec` calls but a C sandbox
-   without `seccomp`/containers is **fundamentally weaker** than the Python
-   one. (This is why real judge engines run C in containers.)
-4. **No seccomp / landlock / resource container.** `setrlimit` is kernel
-   authority but a single goal: **cap resources**, not *isolate filesystem*.
-   It has no namespace isolation, so there is no true VFS containment.
-5. **Shared kernel resources.** `/proc`, `/dev`, network stack, host signals,
-   SysV IPC are not namespaced. A successful native-code exploitation in the
-   child is host-exploitation.
-6. **Statistical/algorithmic CPU bypass.** Programs can sleep (bounded by the
-   watchdog) or interleave compute to stay under `RLIMIT_CPU` while
-   dominating the wall clock — we bound *wall time* too, so worst case is
-   `MAX_WORKERS × timeout` CPU-slot saturation, not infinite.
-7. **Import guard is a defense, not a theorem.** `builtins` shrinking and
-   guarded `__import__` stop the obvious and moderately clever paths; they
-   are not a sound analysis of all Python metaprogramming.
-
-**How a real judge engine would harden this same design:**
-
-| Gap here | Industrial fix |
-|---|---|
-| rlimits only | `seccomp-bpf` allowlist of syscalls (Docker default profile) |
-| filesystem via any syscall | `chroot`/`pivot_root` + `landlock`/`ns` (Docker, gVisor) |
-| no kernel namespaces | run in a container: PID, mount, net, IPC, UTS namespaces |
-| host network/SHM access | container network namespace + read-only rootfs |
-| Python guard is heuristic-audit | PyPy subinterpreters, WASM, or co-located containers per language |
-| single-machine verdict | multi-tenant judge clusters, egress egress blocking, per-run sandbox VMs |
-
-If the threat model is "AI/CS students uploading random snippets", the above
-is a strong, cheap, explainable baseline. If the threat model is "malicious
-nation-state", you want **gVisor/Firecracker** between the code and the
-kernel — nothing in this repo will substitute for that boundary.
-
-### Platform notes
-* The suite is written to pass **identically on Linux/macOS/Windows**: on
-  win32, `resource` is unavailable, so `RLIMIT_*` and `setsid()` are skipped
-  and enforcement degrades to (a) static scans, (b) the import guard, (c) the
-  wall-clock watchdog — programs may allocate big virtual memory and are
-  duration-bounded rather than size-bounded. See `examples/06_mem_alloc.py`.
-* C execution requires `gcc`/`cc`/`clang` on `PATH` (Cython-style judges ship
-  the toolchain in the image).
-
----
-
-## Configuration cheat-sheet
-
-| Key | Default | Meaning |
-|---|---|---|
-| `MAX_WORKERS` | `4` | concurrent executions |
-| `TIMEOUT_SECONDS` | `2.0` | hard wall-clock cap per submission |
-| `CPU_SECONDS` | `2.0` | `RLIMIT_CPU` budget |
-| `MEM_MB` | `256` | `RLIMIT_AS` budget |
-| `MAX_CODE_BYTES` | `1 MiB` | accepted source size |
-| `MAX_RESULT_BYTES` | `4 MiB` | persisted stdout/stderr cap |
-| `DB_PATH` | `./submissions.db` | SQLite location |
-| `POLL_INTERVAL` | `0.2 s` | worker idle polling cadence |
-
-## Testing gotchas
-* Tests use a throwaway DB (via `DB_PATH` env + lazy `config`), never the
-  real `submissions.db`.
-* The suite spawns real subprocesses and a real worker pool (`spawn`), so it
-  is intentionally ~20s. Run `pytest` serial (default) — the pool tests
-  assume a fresh DB per module.
+```text
+api/                 HTTP validation, auth, frontend and health routes
+frontend/            Editor, test cases, history and diagnostics
+sandbox/             Bounded runtime, Docker runner and platform limits
+worker/              Supervision, leases and graceful shutdown
+database.py          Durable queue, claims, results and retention
+config.py            Environment/file settings with startup validation
+tests/               API, queue, execution and demo regressions
+scripts/             Windows startup and HTTP smoke check
+docs/                OpenAPI contract and interview walkthrough
+compose.yaml         API + worker with shared persistent volume
+```

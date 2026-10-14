@@ -1,0 +1,48 @@
+name: codeforge
+x-environment: &environment
+  APP_ENV: production
+  SANDBOX_BACKEND: docker
+  SANDBOX_IMAGE: codeforge-sandbox:local
+  API_TOKEN: ${API_TOKEN:?Generate an API_TOKEN and set it in .env}
+  DB_PATH: /data/submissions.db
+  MAX_WORKERS: ${MAX_WORKERS:-2}
+  MAX_PENDING_JOBS: 100
+services:
+  api:
+    build:
+      context: .
+      target: api
+    environment: *environment
+    ports:
+      - "127.0.0.1:${PORT:-5000}:5000"
+    volumes:
+      - submissions:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+  worker:
+    build:
+      context: .
+      target: worker
+    environment: *environment
+    group_add:
+      - "${DOCKER_GID:-0}"
+    volumes:
+      - submissions:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 65s
+volumes:
+  submissions:

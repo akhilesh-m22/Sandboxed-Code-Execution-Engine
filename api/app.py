@@ -1,175 +1,185 @@
-# api/app.py
-# Flask REST API for the sandboxed code execution engine.
-#
-# It is deliberately stateless about executions: everything flows through
-# the SQLite DB via the database module. The worker pool (a separate process)
-# picks up 'queued' rows, so the API never touches the sandbox directly and
-# stays responsive under load.
-
+"""HTTP boundary for CodeForge; execution belongs to separate workers."""
 from __future__ import annotations
 
+import hmac
+import json
 import logging
-from typing import Optional
+import sqlite3
+import time
+import uuid
+from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 import config
 import database
-import sandbox  # only used here for describe_caps/limits info
+import sandbox
 
 log = logging.getLogger("sandbox.api")
-
-# We accept a *whitelist* of languages. Anything else is rejected at the
-# boundary so we never hand unknown blobs to a compiler.
+ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_LANGUAGES = ("python", "c")
 
 
 def create_app() -> Flask:
+    config.validate()
     app = Flask(__name__)
-    # Application-wide resource caps: users don't get to pick tighter/looser.
-    app.config.update(config.public_dict())
-    app.config["MAX_CONTENT_LENGTH"] = config.MAX_CODE_BYTES + 1024
+    app.config["MAX_CONTENT_LENGTH"] = 6 * (config.MAX_CODE_BYTES + config.MAX_STDIN_BYTES) + 4096
 
-    # ------------------------------------------------------------------
+    @app.before_request
+    def prepare_request():
+        g.request_id = uuid.uuid4().hex
+        g.started_at = time.monotonic()
+        protected = request.path in ("/submit", "/submissions") or request.path.startswith(("/status/", "/result/"))
+        if protected and config.API_TOKEN:
+            expected = ("Bearer " + config.API_TOKEN).encode()
+            supplied = request.headers.get("Authorization", "").encode()
+            if not hmac.compare_digest(supplied, expected):
+                response = jsonify(error="A valid API token is required")
+                response.headers["WWW-Authenticate"] = "Bearer"
+                return response, 401
+
+    @app.after_request
+    def finish_request(response):
+        response.headers["X-Request-ID"] = g.get("request_id", "")
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-eval' blob:; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
+            "font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net data:; "
+            "connect-src 'self' https://cdn.jsdelivr.net; worker-src 'self' blob:; "
+            "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+        )
+        if response.is_json:
+            response.headers["Cache-Control"] = "no-store"
+        log.info("request id=%s method=%s status=%s duration_ms=%.1f", g.get("request_id"), request.method, response.status_code, (time.monotonic() - g.get("started_at", time.monotonic())) * 1000)
+        return response
+
+    @app.get("/")
+    def serve_index():
+        return send_from_directory(ROOT / "frontend", "index.html")
+
+    @app.get("/css/<path:filename>")
+    def serve_css(filename):
+        return send_from_directory(ROOT / "frontend" / "css", filename)
+
+    @app.get("/js/<path:filename>")
+    def serve_js(filename):
+        return send_from_directory(ROOT / "frontend" / "js", filename)
+
     @app.get("/health")
     def health():
-        """Liveness + sandbox capability report (handy for the README and CI)."""
-        return jsonify(
-            {
-                "ok": True,
-                "sandbox": sandbox.describe_caps(),
-                "limits": {
-                    "timeout_seconds": config.TIMEOUT_SECONDS,
-                    "cpu_seconds": config.CPU_SECONDS,
-                    "mem_mb": config.MEM_MB,
-                    "max_workers": config.MAX_WORKERS,
-                },
-            }
-        )
+        return jsonify(ok=True, sandbox=sandbox.describe_caps(), limits=config.public_dict())
 
-    # ------------------------------------------------------------------
+    @app.get("/ready")
+    def ready():
+        workers = database.worker_health()
+        return jsonify(ok=workers["ready"], workers=workers), 200 if workers["ready"] else 503
+
+    @app.get("/api/config")
+    def public_config():
+        limits = config.public_dict()
+        limits["memory_mb"] = config.MEM_MB
+        return jsonify(languages=list(SUPPORTED_LANGUAGES), limits=limits,
+                       sandbox={"backend": config.SANDBOX_BACKEND, "isolated": config.SANDBOX_BACKEND == "docker"},
+                       authentication_required=bool(config.API_TOKEN))
+
+    @app.get("/openapi.json")
+    def openapi():
+        return send_from_directory(ROOT / "docs", "openapi.json")
+
     @app.post("/submit")
     def submit():
-        """Accept source + language (+ optional stdin); return a submission id."""
-        body = request.get_json(silent=True) or {}
-        language = (body.get("language") or "").strip().lower()
-        source = body.get("source") or body.get("code") or ""
-
-        if language not in SUPPORTED_LANGUAGES:
-            return jsonify(
-                {
-                    "error": f"unsupported language {language!r}, "
-                    f"must be one of {list(SUPPORTED_LANGUAGES)}"
-                }
-            ), 400
-        if not source.strip():
-            return jsonify({"error": "source code must not be empty"}), 400
-        if len(source.encode("utf-8", errors="replace")) > config.MAX_CODE_BYTES:
-            return jsonify({"error": "source code exceeds size limit"}), 413
-
-        stdin = body.get("stdin")
+        if not request.is_json:
+            return jsonify(error="Content-Type must be application/json"), 415
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="Request body must be a JSON object"), 400
+        language = body.get("language", "")
+        source = body.get("source", body.get("code", ""))
+        stdin = body.get("stdin", "")
         if stdin is None:
             stdin = ""
-        if not isinstance(stdin, str):
-            return jsonify({"error": "stdin must be a string"}), 400
+        for name, value in (("language", language), ("source", source), ("stdin", stdin)):
+            if not isinstance(value, str):
+                return jsonify(error=f"{name} must be a string"), 400
+        language = language.strip().lower()
+        if language not in SUPPORTED_LANGUAGES:
+            return jsonify(error="Unsupported language; use python or c"), 400
+        if not source.strip():
+            return jsonify(error="Source code must not be empty"), 400
+        for name, value, limit in (("source", source, config.MAX_CODE_BYTES), ("stdin", stdin, config.MAX_STDIN_BYTES)):
+            try:
+                size = len(value.encode("utf-8"))
+            except UnicodeEncodeError:
+                return jsonify(error=f"{name} contains invalid Unicode"), 400
+            if size > limit:
+                return jsonify(error=f"{name} exceeds size limit ({limit} bytes)"), 413
+        if config.APP_ENV == "production" and not database.worker_health()["ready"]:
+            return jsonify(error="No execution workers are ready"), 503
+        try:
+            sub_id = database.create_submission(language, source, stdin)
+        except database.QueueFull:
+            response = jsonify(error="Execution queue is full; retry shortly")
+            response.headers["Retry-After"] = "5"
+            return response, 429
+        response = jsonify(id=sub_id, status="queued", _links={"status": f"/status/{sub_id}", "result": f"/result/{sub_id}"})
+        response.headers["Location"] = f"/status/{sub_id}"
+        return response, 201
 
-        sub_id = database.create_submission(language, source[: config.MAX_CODE_BYTES], stdin)
-        log.info("submitted %s (%s)", sub_id, language)
-        return jsonify(
-            {
-                "id": sub_id,
-                "status": "queued",
-                "_links": {
-                    "status": f"/status/{sub_id}",
-                    "result": f"/result/{sub_id}",
-                },
-            }
-        ), 201
-
-    # ------------------------------------------------------------------
     @app.get("/status/<submission_id>")
-    def status(submission_id: str):
-        """Return the current state machine position of a submission."""
+    def status(submission_id):
         row = database.fetch(submission_id)
         if row is None:
-            return jsonify({"error": "submission not found"}), 404
-        return jsonify(
-            {
-                "id": row["id"],
-                "language": row["language"],
-                "status": row["status"],
-                "submitted_at": row["submitted_at"],
-            }
-        )
+            return jsonify(error="Submission not found"), 404
+        return jsonify({key: row[key] for key in ("id", "language", "status", "submitted_at")})
 
-    # ------------------------------------------------------------------
     @app.get("/result/<submission_id>")
-    def result(submission_id: str):
-        """Return stdout, stderr, exit code and timing for a finished run.
-
-        409 while the job is still queued/running; 404 if unknown id.
-        """
+    def result(submission_id):
         row = database.fetch(submission_id)
         if row is None:
-            return jsonify({"error": "submission not found"}), 404
+            return jsonify(error="Submission not found"), 404
         if row["status"] in ("queued", "running"):
-            msg = (
-                "submission still %s; retry after execution completes" % row["status"]
-            )
-            return jsonify({"error": msg, "id": row["id"], "status": row["status"]}), 409
-        if row["status"] == "failed":
-            return jsonify(
-                {
-                    "id": row["id"],
-                    "status": "failed",
-                    "stdout": row["stdout"],
-                    "stderr": row["stderr"] or "execution failed",
-                    "exit_code": row["exit_code"],
-                    "wall_time": None,
-                }
-            ), 200
-        return jsonify(
-            {
-                "id": row["id"],
-                "status": row["status"],
-                "language": row["language"],
-                "stdout": row["stdout"],
-                "stderr": row["stderr"],
-                "exit_code": row["exit_code"],
-                "wall_time": row.get("resource_usage"),
-            }
-        )
+            response = jsonify(error="Execution has not finished", id=row["id"], status=row["status"])
+            response.headers["Retry-After"] = "1"
+            return response, 409
+        try:
+            usage = json.loads(row.get("resource_usage") or "{}")
+        except (ValueError, TypeError):
+            usage = {}
+        return jsonify(id=row["id"], language=row["language"], status=row["status"],
+                       stdout=row["stdout"] or "", stderr=row["stderr"] or "", exit_code=row["exit_code"],
+                       wall_time=usage.get("wall_time"), resource_usage=usage)
 
-    # ------------------------------------------------------------------
     @app.get("/submissions")
     def submissions():
-        """List the most recent submissions (ids + statuses), newest first."""
-        rows = database.list_recent(limit=max(1, min(int(request.args.get("limit", 20)), 100)))
-        return jsonify({"submissions": rows})
+        try:
+            limit = max(1, min(int(request.args.get("limit", 20)), 100))
+        except (ValueError, TypeError):
+            return jsonify(error="limit must be an integer"), 400
+        return jsonify(submissions=database.list_recent(limit=limit))
 
-    # ------------------------------------------------------------------
-    @app.errorhandler(404)
-    def not_found(_err):
-        return jsonify({"error": "not found"}), 404
+    @app.errorhandler(HTTPException)
+    def http_error(error):
+        return jsonify(error=error.description, request_id=g.get("request_id")), error.code
 
-    @app.errorhandler(405)
-    def method_not_allowed(_err):
-        return jsonify({"error": "method not allowed"}), 405
+    @app.errorhandler(sqlite3.Error)
+    def database_error(error):
+        log.exception("Database request failed")
+        return jsonify(error="Database temporarily unavailable", request_id=g.get("request_id")), 503
 
-    # JSON decode errors (hello, malformed clients)
-    @app.errorhandler(400)
-    def bad_request(_err):
-        return jsonify({"error": "bad request"}), 400
-
-    @app.errorhandler(413)
-    def too_large(_err):
-        return jsonify({"error": "payload too large"}), 413
+    @app.errorhandler(Exception)
+    def unexpected_error(error):
+        log.exception("Unhandled request error")
+        return jsonify(error="Internal server error", request_id=g.get("request_id")), 500
 
     return app
 
 
 app = create_app()
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

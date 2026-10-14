@@ -7,3 +7,9 @@ submissions.db-wal
 submissions.db-shm
 config.json
 *.log
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+artifacts/

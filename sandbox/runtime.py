@@ -1,37 +1,14 @@
-# sandbox/runtime.py
-# ---------------------------------------------------------------------------
-# Process-level isolation runtime.
-#
-# The isolation model (in rough order of strength):
-#
-#   1. STATIC pre-checks      (sandbox/prechecks.py)      -- cheap filter
-#   2. Python runtime jail    (this module + generated runner.py)
-#      -- a guarded __import__ + warmly preloaded stdlib + stacked builtins,
-#      so dangerous modules (os/subprocess/socket/sys/...) are unimportable
-#      at runtime and the classic escape builtins do not exist.
-#   3. C compiler flags (-Wall -Wextra -Werror -fno-builtin -pie)
-#      -- the compiler IS the static filter for C: an undeclared call
-#      (system/fork/socket/...) is a hard compile error in C11.
-#   4. Process jail:
-#        - stripped environment        -> nothing to leak
-#        - isolated empty workdir      -> no access to the rest of the repo
-#        - RLIMIT_CPU / RLIMIT_AS / RLIMIT_NPROC (POSIX)
-#        - new process group + preexec -> group-kill reaps grandchildren
-#        - wall-clock watchdog thread  -> guaranteed kill on stuck progress
-#
-# Why a bootstrap "runner.py" instead of launching `python <src>` directly?
-# Launching the source with plain flags (-I) still exposes the full stdlib
-# (os.environ, subprocess, socket, ctypes, ...). The bootstrap replaces
-# builtins.__import__ with a guard that raises ImportError for forbidden
-# roots *regardless of the source text*, and shrinks the builtins dict. The
-# guard only works because a curated stdlib prefix is imported first, before
-# the guard is installed -- so legitimate modules like `random`/`json` can
-# still load their own internal `os`/`sys` dependencies, while *user* code
-# importing them directly is refused.
-# ---------------------------------------------------------------------------
+"""Execution backends and bounded subprocess capture.
+
+Docker is the security boundary for untrusted submissions. The process
+backend is exclusively for trusted local development: working directories,
+Python import filters and compiler warnings do not prevent host access.
+"""
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import shutil
 import subprocess
@@ -39,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .prechecks import check_c, check_python, FORBIDDEN_IMPORTS
@@ -61,6 +39,7 @@ _SAFE_BUILTINS = tuple(
             "min", "next", "object", "oct", "ord", "pow", "print",
             "property", "range", "repr", "reversed", "round", "set",
             "slice", "sorted", "staticmethod", "str", "sum", "tuple", "zip",
+            "__build_class__", "super", "type",
             # exceptions users may legitimately catch/raise
             "Exception", "BaseException", "ArithmeticError", "AssertionError",
             "AttributeError", "EOFError", "ImportError", "IndexError",
@@ -99,24 +78,35 @@ _STRIP_FROM_OS = (
 
 
 def describe_caps() -> Dict[str, str]:
-    """Return a dict of effective sandbox capabilities (for tests/readme)."""
-    caps: Dict[str, str] = {
-        "platform": sys.platform,
-        "wallclock_watchdog": "true",
-        "python_guarded_import": "true",
-        "python_restricted_builtins": "true",
-        "python_preloaded_libs": str(len(_PRELOADED_LIBS)),
-        "c_werror_filter": "true",
-    }
-    try:
-        import resource  # noqa: F401
+    """Describe configured guarantees; this is not a Docker readiness probe."""
+    import config
 
-        for attr in ("RLIMIT_CPU", "RLIMIT_AS", "RLIMIT_NPROC"):
-            caps[f"posix:{attr.lower()}"] = str(hasattr(resource, attr))
-    except ImportError:
-        caps["posix_rlimits"] = "unavailable (win32)"
-    caps["killpg"] = str(hasattr(os, "killpg"))
-    return caps
+    backend = config.SANDBOX_BACKEND
+    return {
+        "backend": backend,
+        "platform": sys.platform,
+        "security_boundary": "linux-container" if backend == "docker" else "none (trusted local development only)",
+        "network_isolation": str(backend == "docker").lower(),
+        "filesystem_isolation": str(backend == "docker").lower(),
+        "bounded_output": "true",
+        "wallclock_timeout": "true",
+        "process_tree_cleanup": "true",
+        "memory_limit": "container cgroup" if backend == "docker" else ("Windows Job Object" if os.name == "nt" else "RLIMIT_AS"),
+        "python_filters": "defense in depth; not a security boundary",
+    }
+
+
+def check_backend():
+    """Fail startup if Docker or the configured Linux runner image is missing."""
+    import config
+    docker = shutil.which("docker")
+    if not docker:
+        raise RuntimeError("Docker CLI not found; install Docker or use process for trusted local demos")
+    for args, expected in ((["info", "--format", "{{.OSType}}"], "linux"),
+                           (["image", "inspect", "--format", "{{.Os}}", config.SANDBOX_IMAGE], "linux")):
+        result = subprocess.run([docker, *args], capture_output=True, text=True, timeout=15)
+        if result.returncode or result.stdout.strip() != expected:
+            raise RuntimeError("Docker requires a running Linux daemon and a built SANDBOX_IMAGE")
 
 
 # =========================================================================
@@ -156,7 +146,7 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
     """
     if hasattr(os, "killpg"):
         try:
-            os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL the whole group
+            os.killpg(proc.pid, 9)  # SIGKILL the whole group
             return
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -259,41 +249,6 @@ def _write_bootstrap(workdir: str) -> None:
 
 
 # =========================================================================
-# POSIX resource limits.
-# =========================================================================
-
-def _apply_posix_limits(cpu_seconds: float, mem_mb: int, max_procs: int) -> None:
-    """Apply hard rlimits to the *current process* (executed pre-exec in the
-    child). Sets a new process group first so the watchdog can group-kill.
-
-    Failures are silent by design: losing an rlimit means the CPU/memory
-    enforcement falls back to the wall-clock watchdog -- a graceful
-    degradation rather than a silent security hole.
-    """
-    if os.name != "posix":
-        return
-    import resource
-
-    try:
-        os.setsid()  # start a fresh session/process group
-    except Exception:
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (int(cpu_seconds), int(cpu_seconds) + 1))
-    except Exception:
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024 * 1024, mem_mb * 1024 * 1024))
-    except Exception:
-        pass
-    if max_procs > 0:
-        try:
-            resource.setrlimit(resource.RLIMIT_NPROC, (max_procs, max_procs))
-        except Exception:
-            pass
-
-
-# =========================================================================
 # Language-specific argv builders.
 # =========================================================================
 
@@ -308,56 +263,14 @@ def _build_python_argv(source: str, workdir: str) -> Tuple[List[str], str]:
     return argv, workdir
 
 
-def _compile_c(source: str, workdir: str) -> Optional[str]:
-    """Compile C source into workdir; returns path to the binary or None
-    (with the human-readable compile rejection written to <workdir>/err.txt).
-    """
-    src_path = os.path.join(workdir, "main.c")
-    with open(src_path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(source)
+def _output_limit(value: Optional[int]) -> int:
+    if value is None:
+        import config
+        value = config.MAX_RESULT_BYTES
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("max_output_bytes must be a positive integer")
+    return value
 
-    cc = shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
-    if cc is None:
-        raise RuntimeError("no C compiler found on PATH (need gcc/cc/clang)")
-
-    out_path = os.path.join(workdir, "main" + (".exe" if os.name == "nt" else ""))
-
-    # -std=c11 -Wall -Wextra -Werror : foundational safety net. An implicit
-    # declaration (call to system/fork/exec*/socket without a prototype) is a
-    # hard compile error in C11 -- the compiler is the authoritative static
-    # filter for C. -fno-builtin/-fPIE/-pie: predictable, position-independent
-    # code and no clever builtin substitutions.
-    cmd = [
-        cc,
-        "-std=c11",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-O1",
-        "-fno-builtin",
-        "-fPIE",
-        "-pie",
-        "-o",
-        out_path,
-        src_path,
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if proc.returncode != 0:
-        err_text = proc.stderr.decode("utf-8", errors="replace") or "compile failed"
-        with open(os.path.join(workdir, "err.txt"), "w", encoding="utf-8") as fh:
-            fh.write(err_text)
-        return None
-    return out_path
-
-
-# =========================================================================
-# The core runner.
-# =========================================================================
 
 def run_language(
     language: str,
@@ -366,155 +279,277 @@ def run_language(
     timeout: float = 2.0,
     cpu_seconds: float = 2.0,
     mem_mb: int = 256,
+    max_output_bytes: Optional[int] = None,
 ) -> Dict[str, object]:
-    """Sandboxed execution of untrusted source.
+    """Run source with the explicitly configured backend, never a fallback."""
+    import config
 
-    Returns a dict with stdout/stderr (str), exit_code (int), timed_out
-    (bool) and wall_time (float seconds). This function is what the workers
-    call; it never raises for user-code failures (only for engine/compiler
-    absence).
-    """
-    if language == "python":
-        allowed, reason = check_python(source)
-        if not allowed:
-            return _result(b"", reason.encode(), -1, False)
-    elif language == "c":
-        allowed, reason = check_c(source)
-        if not allowed:
-            return _result(b"", reason.encode(), -1, False)
-    else:
+    max_output_bytes = _output_limit(max_output_bytes)
+    for name, value in (("timeout", timeout), ("cpu_seconds", cpu_seconds)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if isinstance(mem_mb, bool) or not isinstance(mem_mb, int) or mem_mb < 16:
+        raise ValueError("mem_mb must be an integer of at least 16")
+    checks = {"python": check_python, "c": check_c}
+    if language not in checks:
         return _result(b"", f"unsupported language: {language!r}".encode(), -1, False)
+    allowed, reason = checks[language](source)
+    if not allowed:
+        return _result(b"", reason.encode(), -1, False)
+    backend = config.SANDBOX_BACKEND
+    if backend == "docker":
+        return _run_docker(language, source, stdin, timeout, cpu_seconds, mem_mb, max_output_bytes)
+    if backend == "process":
+        return _run_process(language, source, stdin, timeout, cpu_seconds, mem_mb, max_output_bytes)
+    raise ValueError(f"unsupported SANDBOX_BACKEND: {backend!r}")
 
-    # A brand-new, empty directory only the child can write to. It is removed
-    # after execution -- the submission has no persistent home.
-    workdir = tempfile.mkdtemp(prefix="sandbox_")
-    try:
+
+def _run_process(language, source, stdin, timeout, cpu_seconds, mem_mb, max_output_bytes):
+    """Trusted-development runner; also used *inside* the isolated container."""
+    with tempfile.TemporaryDirectory(prefix="sandbox_") as workdir:
         if language == "python":
             argv, cwd = _build_python_argv(source, workdir)
         else:
-            try:
-                binary = _compile_c(source, workdir)
-            except RuntimeError as exc:
-                # Engine-level problem (missing compiler) -- surface as a
-                # failed submission, not an unhandled exception.
-                return _result(b"", str(exc).encode(), -1, False)
-            if binary is None:
-                return _read_compile_error(workdir)
+            compiler = shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
+            if compiler is None:
+                return _result(b"", b"no C compiler found on PATH (need gcc/cc/clang)", -1, False)
+            src_path = os.path.join(workdir, "main.c")
+            with open(src_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(source)
+            binary = os.path.join(workdir, "main.exe" if os.name == "nt" else "main")
+            compilation = run_command(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
+                 "-fno-builtin", "-fPIE", "-pie", "-o", binary, src_path],
+                cwd=workdir, timeout=10.0, cpu_seconds=10.0,
+                mem_mb=max(mem_mb, 256), max_output_bytes=max_output_bytes,
+            )
+            if compilation["exit_code"] != 0:
+                compilation["stderr"] = "compilation failed:\n" + compilation["stderr"]
+                return _bounded_result(compilation, max_output_bytes)
             argv, cwd = [binary], workdir
         return run_command(
-            argv,
-            cwd=cwd,
-            stdin=stdin,
-            timeout=timeout,
-            cpu_seconds=cpu_seconds,
-            mem_mb=mem_mb,
+            argv, cwd=cwd, stdin=stdin, timeout=timeout, cpu_seconds=cpu_seconds,
+            mem_mb=mem_mb, max_output_bytes=max_output_bytes,
         )
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _read_compile_error(workdir: str) -> Dict[str, object]:
+def _run_docker(language, source, stdin, timeout, cpu_seconds, mem_mb, max_output_bytes):
+    import config
+
+    docker = shutil.which("docker")
+    if docker is None:
+        return _result(b"", b"Docker backend unavailable: docker CLI was not found. No fallback is permitted.", 127, False)
+    name = "codeforge-" + uuid.uuid4().hex
+    # No host bind mounts, Docker socket, host environment or privileged mode
+    # is passed to a submission. --pull=never makes a missing image fail closed.
+    create = [
+        docker, "create", "--name", name, "--pull=never", "--interactive", "--rm",
+        "--network=none", "--read-only", "--cap-drop=ALL",
+        "--security-opt=no-new-privileges:true", "--user=65534:65534",
+        "--pids-limit=64", f"--memory={mem_mb}m", f"--memory-swap={mem_mb}m",
+        "--cpus=1.0", "--ulimit", "nofile=64:64", "--ulimit", "core=0:0",
+        "--ulimit", "fsize=16777216:16777216", "--log-driver=none",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+        "--tmpfs", "/work:rw,exec,nosuid,nodev,size=32m,mode=1777",
+        "--workdir=/work", "--env=TMPDIR=/work", "--env=HOME=/work",
+        config.SANDBOX_IMAGE,
+    ]
+    host_env = os.environ.copy()  # For Docker client/context; never sent to the container.
     try:
-        with open(os.path.join(workdir, "err.txt"), encoding="utf-8") as fh:
-            msg = fh.read()
-    except OSError:
-        msg = "compilation failed"
-    return _result(b"", f"compilation failed:\n{msg}".encode(), 127, False)
+        created = run_command(
+            create, cwd=tempfile.gettempdir(), timeout=15, max_output_bytes=16384,
+            enforce_limits=False, env=host_env,
+        )
+        if created["exit_code"] != 0:
+            created["stderr"] = "Docker container could not be created: " + created["stderr"]
+            return _bounded_result(created, max_output_bytes)
+        payload = json.dumps({
+            "language": language, "source": source,
+            "stdin": stdin.decode("utf-8", errors="replace"),
+            "timeout": timeout, "cpu_seconds": cpu_seconds,
+            "mem_mb": mem_mb, "max_output_bytes": max_output_bytes,
+        }, ensure_ascii=True).encode("utf-8")
+        attached = run_command(
+            [docker, "start", "--attach", "--interactive", name],
+            cwd=tempfile.gettempdir(), stdin=payload,
+            # Runtime has its own wall clock; this outer cap also bounds startup
+            # and compilation. rm --force in finally terminates the container.
+            timeout=timeout + (10 if language == "c" else 0) + 10,
+            max_output_bytes=max_output_bytes * 6 + 65536,
+            enforce_limits=False, env=host_env,
+        )
+        if attached["exit_code"] != 0 or attached["output_truncated"]:
+            attached["stderr"] = "Docker sandbox failed: " + attached["stderr"]
+            return _bounded_result(attached, max_output_bytes)
+        try:
+            result = json.loads(attached["stdout"])
+            if not isinstance(result, dict):
+                raise ValueError("result is not an object")
+            if not isinstance(result.get("stdout"), str) or not isinstance(result.get("stderr"), str):
+                raise ValueError("invalid output fields")
+            if type(result.get("exit_code")) is not int or type(result.get("timed_out")) is not bool:
+                raise ValueError("invalid status fields")
+            if type(result.get("output_truncated")) is not bool:
+                raise ValueError("invalid output status")
+            wall = result.get("wall_time")
+            if wall is not None and (type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0):
+                raise ValueError("invalid duration")
+            return _result(
+                result["stdout"].encode(), result["stderr"].encode(),
+                result["exit_code"], result["timed_out"], wall=wall,
+                output_truncated=result["output_truncated"], max_output_bytes=max_output_bytes,
+            )
+        except (ValueError, TypeError):
+            return _result(b"", b"Docker sandbox returned an invalid response.", 127, False)
+    finally:
+        # Removing by the known random name also handles create timing out after
+        # the daemon accepted it. Never just kill the attached Docker client.
+        run_command(
+            [docker, "rm", "--force", name], cwd=tempfile.gettempdir(),
+            timeout=10, max_output_bytes=16384, enforce_limits=False, env=host_env,
+        )
 
 
 def run_command(
-    argv: Sequence[str],
-    cwd: str,
-    stdin: bytes = b"",
-    timeout: float = 2.0,
-    cpu_seconds: float = 2.0,
-    mem_mb: int = 256,
+    argv: Sequence[str], cwd: str, stdin: bytes = b"", timeout: float = 2.0,
+    cpu_seconds: float = 2.0, mem_mb: int = 256,
+    max_output_bytes: Optional[int] = None, *, enforce_limits: bool = True,
+    env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
-    """The heart of the sandbox: spawn -> jail -> watch -> reap.
+    """Capture a child with a shared stdout/stderr byte budget and tree cleanup.
 
-      * cwd    = the fresh empty workdir
-      * env    = clean_env() (stripped of host secrets)
-      * preexec_posix: new process group + RLIMIT_CPU/AS/NPROC (POSIX)
-      * stdout/stderr = captured through pipes (no temp-file handles leaked)
-      * watchdog thread enforces a hard wall-clock deadline even if the main
-        thread's communicate() is wedged on uninterruptible IO.
+    Reader threads discard excess bytes immediately and signal termination;
+    communicate() is deliberately avoided because it buffers without a limit.
+    POSIX limits use an exec helper, avoiding preexec_fn's threaded deadlocks.
     """
-    env = clean_env()
-
-    def _preexec():
-        _apply_posix_limits(cpu_seconds, mem_mb, max_procs=1)
-
-    try:
-        proc: subprocess.Popen = subprocess.Popen(
-            list(argv),
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=_preexec if os.name == "posix" else None,
-        )
-    except Exception as exc:  # interpreter/binary never started
-        return _result(b"", f"failed to start sandboxed process: {exc}".encode(), 127, False)
-
+    max_output_bytes = _output_limit(max_output_bytes)
+    command = list(argv)
+    if enforce_limits and os.name == "posix":
+        command = [sys.executable, "-I", "-S", os.path.join(os.path.dirname(__file__), "posix_exec.py"),
+                   str(cpu_seconds), str(mem_mb)] + command
     started = time.monotonic()
-    watchdog = threading.Thread(
-        target=_watchdog,
-        args=(proc, timeout),
-        name="sandbox-watchdog",
-        daemon=True,
-    )
-    watchdog.start()
-
-    timed_out = False
-    out = b""
-    err = b""
+    job = None
     try:
-        out, err = proc.communicate(input=stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Wall-clock limit hit: the submission was stuck. Nuke the whole tree.
-        timed_out = True
-        kill_process_tree(proc)
-        proc.wait()
-        out = b""
-        err = b"Execution timed out after %.1fs (wall clock).\n" % timeout
+        proc = subprocess.Popen(
+            command, cwd=cwd, env=clean_env() if env is None else env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, start_new_session=(os.name == "posix"),
+        )
+        if enforce_limits and os.name == "nt":
+            from .windows_job import WindowsJob
+            try:
+                job = WindowsJob(proc, mem_mb)
+            except OSError:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    stream.close()
+                raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _result(b"", f"failed to start limited process: {exc}".encode(), 127, False)
+
+    buffers = [bytearray(), bytearray()]
+    lock = threading.Lock()
+    exceeded = threading.Event()
+    used = 0
+
+    def read_output(stream, target):
+        nonlocal used
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                with lock:
+                    remaining = max_output_bytes - used
+                    buffers[target].extend(chunk[:remaining])
+                    used += min(len(chunk), remaining)
+                    if len(chunk) > remaining:
+                        exceeded.set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            stream.close()
+
+    def write_input():
+        try:
+            view = memoryview(stdin)
+            while view:
+                count = proc.stdin.write(view[:8192])
+                if not count:
+                    break
+                view = view[count:]
+        except (OSError, ValueError):
+            pass
+        finally:
+            proc.stdin.close()
+
+    readers = [threading.Thread(target=read_output, args=(stream, index), daemon=True)
+               for index, stream in enumerate((proc.stdout, proc.stderr))]
+    writer = threading.Thread(target=write_input, daemon=True)
+    for thread in readers + [writer]:
+        thread.start()
+    timed_out = False
+    try:
+        while proc.poll() is None or any(thread.is_alive() for thread in readers):
+            if exceeded.is_set():
+                break
+            if time.monotonic() - started >= timeout:
+                timed_out = True
+                break
+            exceeded.wait(0.01)
     finally:
-        watchdog.join(timeout=5)
-
-    wall = time.monotonic() - started
-    return _result(out, err, proc.returncode, timed_out, wall=wall)
-
-
-def _watchdog(proc: subprocess.Popen, timeout: float) -> None:
-    """Daemon thread enforcing a hard wall-clock cap.
-
-    Normal timeouts are handled by communicate(timeout=...) in the main
-    thread; this thread only claims the kill when the main thread is stuck
-    (e.g. blocked in uninterruptible IO that swallows the OS signal), or to
-    guarantee the process TREE (forked children) is killed, which
-    communicate() cannot do by itself.
-    """
-    deadline = time.monotonic() + timeout + 1.0
-    while True:
-        if proc.poll() is not None:
-            return  # exited on its own
-        if time.monotonic() > deadline:
+        # Always terminate the group, even after the direct child exited: a
+        # descendant may still hold a pipe or outlive its parent.
+        if job is not None:
+            job.kill()
+            job.close()
+        else:
             kill_process_tree(proc)
-            return
-        time.sleep(0.05)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for thread in readers + [writer]:
+            thread.join(timeout=1)
+    out, err = bytes(buffers[0]), bytes(buffers[1])
+    if timed_out:
+        # Put the diagnostic first so it survives a nearly full output budget.
+        err = ("Execution timed out after %.2fs (wall clock).\n" % timeout).encode() + err
+    if exceeded.is_set():
+        err = b"Output limit exceeded.\n" + err
+    return _result(
+        out, err, -1 if exceeded.is_set() or timed_out else (proc.returncode if proc.returncode is not None else -1), timed_out,
+        wall=time.monotonic() - started, output_truncated=exceeded.is_set(),
+        max_output_bytes=max_output_bytes,
+    )
+
+
+def _bounded_result(result, limit):
+    return _result(
+        result["stdout"].encode(), result["stderr"].encode(),
+        result["exit_code"], result["timed_out"], wall=result.get("wall_time"),
+        output_truncated=result.get("output_truncated", False), max_output_bytes=limit,
+    )
 
 
 def _result(
-    stdout: bytes,
-    stderr: bytes,
-    exit_code: int,
-    timed_out: bool,
-    wall: Optional[float] = None,
+    stdout: bytes, stderr: bytes, exit_code: int, timed_out: bool,
+    wall: Optional[float] = None, output_truncated: bool = False,
+    max_output_bytes: Optional[int] = None,
 ) -> Dict[str, object]:
+    if max_output_bytes is not None:
+        # Replacement characters can expand invalid UTF-8. Bound the encoded
+        # response too, including the diagnostics added by the supervisor.
+        stdout = stdout.decode("utf-8", errors="replace").encode("utf-8")
+        stderr = stderr.decode("utf-8", errors="replace").encode("utf-8")
+        if len(stdout) + len(stderr) > max_output_bytes:
+            output_truncated = True
+        stderr = stderr[:max_output_bytes]
+        stdout = stdout[:max(0, max_output_bytes - len(stderr))]
     return {
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "wall_time": wall,
+        "stdout": stdout.decode("utf-8", errors="ignore" if max_output_bytes else "replace"),
+        "stderr": stderr.decode("utf-8", errors="ignore" if max_output_bytes else "replace"),
+        "exit_code": exit_code, "timed_out": timed_out, "wall_time": wall,
+        "output_truncated": output_truncated,
     }

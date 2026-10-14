@@ -53,6 +53,8 @@ def test_requeue_stuck_rows(tmp_db_path):
     sub_id = database.create_submission("python", "print(1)")
     database.claim_next("worker-deadpid")
     assert database.fetch(sub_id)["status"] == "running"
+    database.heartbeat("worker-deadpid")
+    database.expire_worker("worker-deadpid")
     database.requeue_stuck()
     assert database.fetch(sub_id)["status"] == "queued"
     assert database.fetch(sub_id)["executor_pid"] is None

@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CodeForge — Code Execution Studio</title>
+    <meta name="description" content="High-performance, LeetCode-inspired sandboxed code execution engine with multi-layer security, Monaco Editor, real-time analytics, and automated test cases.">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+
+    <!-- Ambient animated background orbs -->
+    <div class="bg-ambient" aria-hidden="true">
+        <div class="bg-glow bg-glow--primary"></div>
+        <div class="bg-glow bg-glow--secondary"></div>
+        <div class="bg-glow bg-glow--accent"></div>
+        <div class="bg-grid-overlay"></div>
+    </div>
+
+    <!-- Celebration Confetti Canvas -->
+    <canvas id="confetti-canvas" class="confetti-canvas" aria-hidden="true"></canvas>
+
+    <!-- ========== NAVBAR ========== -->
+    <header class="navbar" id="navbar">
+        <div class="navbar__brand">
+            <div class="navbar__logo" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="url(#logo-grad)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                    <defs>
+                        <linearGradient id="logo-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#818cf8"/>
+                            <stop offset="50%" stop-color="#c084fc"/>
+                            <stop offset="100%" stop-color="#38bdf8"/>
+                        </linearGradient>
+                    </defs>
+                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                </svg>
+            </div>
+            <h1 class="navbar__title">Code<span class="navbar__title--accent">Forge</span></h1>
+            <span class="navbar__badge" id="platform-badge">execution studio</span>
+            <div class="navbar__status-indicator" id="navbar-engine-status" title="Execution Engine Online">
+                <span class="pulse-dot"></span>
+                <span class="engine-status-text">Connecting…</span>
+            </div>
+        </div>
+
+        <div class="navbar__center">
+            <!-- Problem Selector Pill -->
+            <div class="problem-selector-pill" id="problem-selector-wrap">
+                <span class="pill-label">Problem:</span>
+                <select class="problem-dropdown" id="problem-select" aria-label="Select coding problem">
+                    <optgroup label="Algorithms (LeetCode-Style)">
+                        <option value="custom">⚡ Freeform Sandbox (Blank)</option>
+                        <option value="two-sum" selected>1. Two Sum [Easy]</option>
+                        <option value="palindrome-number">9. Palindrome Number [Easy]</option>
+                        <option value="valid-parentheses">20. Valid Parentheses [Easy]</option>
+                        <option value="max-subarray">53. Maximum Subarray [Medium]</option>
+                        <option value="prime-sieve">204. Prime Sieve Benchmark [Medium]</option>
+                    </optgroup>
+                    <optgroup label="Resource Limits &amp; Source Filters">
+                        <option value="sec-fork-bomb">Source filter: Process creation</option>
+                        <option value="sec-fs-escape">Source filter: File access</option>
+                        <option value="sec-infinite-loop">Resource limit: Infinite loop</option>
+                        <option value="sec-mem-bomb">Resource limit: Memory allocation</option>
+                    </optgroup>
+                </select>
+                <svg class="dropdown-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+            </div>
+        </div>
+
+        <div class="navbar__actions">
+            <button class="btn btn--ghost btn--sm" id="btn-access">Access</button>
+            <!-- Audio sound toggle -->
+            <button class="nav-btn" id="btn-sound-toggle" aria-label="Toggle sound effects" title="Toggle audio feedback">
+                <svg class="icon-sound-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+                <svg class="icon-sound-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" hidden><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+            </button>
+
+            <!-- Keyboard shortcut hint -->
+            <div class="navbar__shortcut" id="shortcut-hint" title="Press Ctrl+Enter to execute">
+                <kbd>Ctrl</kbd><span>+</span><kbd>Enter</kbd>
+                <span class="navbar__shortcut-label">Run</span>
+            </div>
+
+            <!-- Shortcuts dialog button -->
+            <button class="nav-btn" id="btn-shortcuts-help" aria-label="Keyboard Shortcuts" title="View keyboard shortcuts">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            </button>
+
+            <!-- Theme selector -->
+            <div class="theme-dropdown-wrap">
+                <button class="nav-btn theme-toggle" id="theme-toggle" aria-label="Change Theme" title="Theme Selector">
+                    <svg class="theme-icon theme-icon--dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                    <svg class="theme-icon theme-icon--light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" hidden><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                </button>
+            </div>
+        </div>
+    </header>
+    <div class="deployment-strip" role="status">
+        <span id="deployment-mode">Checking execution environment…</span>
+        <span id="queue-status">Workers: checking</span>
+        <a href="/openapi.json" target="_blank" rel="noopener">API reference ↗</a>
+    </div>
+
+    <!-- ========== WORKSPACE ========== -->
+    <main class="workspace" id="workspace">
+
+        <!-- Left sidebar with tabs -->
+        <aside class="sidebar" id="sidebar">
+            <!-- Sidebar Navigation Tabs -->
+            <div class="sidebar-tabs" role="tablist">
+                <button class="sidebar-tab active" data-side-tab="problem" role="tab" aria-selected="true" id="side-tab-problem">
+                    <span class="tab-icon">📖</span> Problem
+                </button>
+                <button class="sidebar-tab" data-side-tab="security" role="tab" aria-selected="false" id="side-tab-security">
+                    <span class="tab-icon">🛡️</span> Sandbox
+                </button>
+                <button class="sidebar-tab" data-side-tab="history" role="tab" aria-selected="false" id="side-tab-history">
+                    <span class="tab-icon">📋</span> History
+                    <span class="history-count-badge" id="history-count" hidden>0</span>
+                </button>
+            </div>
+
+            <div class="sidebar__scroll">
+
+                <!-- 1. PROBLEM DESCRIPTION TAB -->
+                <div class="sidebar-panel active" id="side-panel-problem">
+                    <div class="problem-card">
+                        <div class="problem-header">
+                            <span class="difficulty-badge difficulty-easy" id="problem-difficulty">Easy</span>
+                            <span class="problem-tag" id="problem-tag">Array · Hash Table</span>
+                        </div>
+                        <h2 class="problem-title" id="problem-title">1. Two Sum</h2>
+
+                        <div class="problem-body" id="problem-description">
+                            <p>Given an array of integers <code>nums</code> and an integer <code>target</code>, return <em>indices of the two numbers such that they add up to <code>target</code></em>.</p>
+                            <p>You may assume that each input would have <strong>exactly one solution</strong>, and you may not use the same element twice.</p>
+
+                            <div class="code-example">
+                                <div class="example-title">Example 1:</div>
+                                <div class="example-box">
+                                    <strong>Input:</strong> nums = [2,7,11,15], target = 9<br>
+                                    <strong>Output:</strong> [0,1]<br>
+                                    <strong>Explanation:</strong> Because nums[0] + nums[1] == 9, we return [0, 1].
+                                </div>
+                            </div>
+
+                            <div class="code-example">
+                                <div class="example-title">Example 2:</div>
+                                <div class="example-box">
+                                    <strong>Input:</strong> nums = [3,2,4], target = 6<br>
+                                    <strong>Output:</strong> [1,2]
+                                </div>
+                            </div>
+
+                            <div class="problem-constraints">
+                                <div class="constraints-title">Constraints:</div>
+                                <ul>
+                                    <li><code>2 &le; nums.length &le; 10<sup>4</sup></code></li>
+                                    <li><code>-10<sup>9</sup> &le; nums[i] &le; 10<sup>9</sup></code></li>
+                                    <li><code>-10<sup>9</sup> &le; target &le; 10<sup>9</sup></code></li>
+                                    <li>Only one valid answer exists.</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. SANDBOX SECURITY TAB -->
+                <div class="sidebar-panel" id="side-panel-security" hidden>
+                    <!-- Capabilities card -->
+                    <div class="card" id="capabilities-card">
+                        <div class="card__header">
+                            <span class="card__icon">🛡️</span>
+                            <h3 class="card__title">Security Defenses</h3>
+                        </div>
+                        <div class="card__body" id="caps-body">
+                            <div class="skeleton-list" id="caps-skeleton">
+                                <div class="skeleton"></div>
+                                <div class="skeleton skeleton--short"></div>
+                                <div class="skeleton"></div>
+                            </div>
+                            <dl class="caps-list" id="caps-list"></dl>
+                        </div>
+                    </div>
+
+                    <!-- Limits card -->
+                    <div class="card" id="limits-card">
+                        <div class="card__header">
+                            <span class="card__icon">⏱️</span>
+                            <h3 class="card__title">Resource Caps</h3>
+                        </div>
+                        <div class="card__body" id="limits-body">
+                            <div class="skeleton-list" id="limits-skeleton">
+                                <div class="skeleton"></div>
+                                <div class="skeleton skeleton--short"></div>
+                            </div>
+                            <dl class="caps-list" id="limits-list"></dl>
+                        </div>
+                    </div>
+
+                    <!-- Sandbox Architecture Info -->
+                    <div class="card card--info">
+                        <div class="card__header">
+                            <span class="card__icon">⚡</span>
+                            <h3 class="card__title">Execution Model</h3>
+                        </div>
+                        <div class="card__body">
+                            <ul class="sandbox-spec-list">
+                                <li><strong>Execution:</strong> One temporary workspace per run</li>
+                                <li><strong>Python:</strong> Source filters and restricted imports</li>
+                                <li><strong>C Compiler:</strong> <code>gcc -Werror</code> diagnostics</li>
+                                <li><strong>Limits:</strong> Time, memory and captured output</li>
+                                <li><strong>Concurrency:</strong> SQLite atomic claiming queue</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. SUBMISSIONS HISTORY TAB -->
+                <div class="sidebar-panel" id="side-panel-history" hidden>
+                    <div class="card card--history">
+                        <div class="card__header">
+                            <span class="card__icon">📋</span>
+                            <h3 class="card__title">Recent Submissions</h3>
+                            <button class="btn btn--icon btn--sm" id="btn-refresh-history" title="Refresh history" aria-label="Refresh history">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+                            </button>
+                        </div>
+                        <div class="card__body card__body--flush">
+                            <div class="history-list" id="history-list">
+                                <p class="history-empty" id="history-empty">No submissions yet.<br>Run code or test cases to populate history!</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </aside>
+
+        <!-- Vertical gutter -->
+        <div class="gutter gutter--vertical" id="gutter-v" role="separator" aria-label="Resize sidebar" tabindex="0"></div>
+
+        <!-- Right main panel (Editor + Output) -->
+        <div class="main-panel" id="main-panel">
+
+            <!-- Editor section -->
+            <section class="editor-section" id="editor-section">
+                <div class="editor-toolbar" id="editor-toolbar">
+                    <div class="editor-toolbar__left">
+                        <!-- Language selector -->
+                        <div class="lang-select-wrap">
+                            <select class="lang-select" id="lang-select" aria-label="Programming language">
+                                <option value="python" selected>🐍  Python 3</option>
+                                <option value="c">⚙️  C (GCC)</option>
+                            </select>
+                            <svg class="lang-select__arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                        </div>
+
+                        <!-- Editor Controls: Font Size, Word Wrap -->
+                        <div class="editor-font-controls">
+                            <button class="toolbar-btn" id="btn-font-dec" title="Decrease font size (Ctrl+-)" aria-label="Decrease font size">A-</button>
+                            <button class="toolbar-btn" id="btn-font-inc" title="Increase font size (Ctrl+=)" aria-label="Increase font size">A+</button>
+                            <button class="toolbar-btn" id="btn-word-wrap" title="Toggle Word Wrap" aria-label="Toggle Word Wrap">Wrap</button>
+                        </div>
+                    </div>
+
+                    <div class="editor-toolbar__right">
+                        <!-- Copy Code Button -->
+                        <button class="btn btn--ghost btn--sm" id="btn-copy-code" title="Copy code to clipboard">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                            Copy
+                        </button>
+
+                        <!-- Reset to starter code -->
+                        <button class="btn btn--ghost btn--sm" id="btn-reset" title="Reset starter code">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                            Reset
+                        </button>
+
+                        <!-- Run Active Testcase Button -->
+                        <button class="btn btn--run" id="btn-run" title="Run active test case (Ctrl+Enter)">
+                            <span class="btn-run__play" aria-hidden="true">▶</span>
+                            <span class="btn-run__text">Run Code</span>
+                            <span class="btn-run__spinner" aria-hidden="true"></span>
+                        </button>
+
+                        <!-- Submit / Run All Cases (The LeetCode Submit Button!) -->
+                        <button class="btn btn--submit" id="btn-submit-all" title="Test all cases & submit (Ctrl+Shift+Enter)">
+                            <span class="btn-submit__icon" aria-hidden="true">⚡</span>
+                            <span class="btn-submit__text">Submit All</span>
+                            <span class="btn-submit__spinner" aria-hidden="true"></span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Monaco Container + Fallback Codearea -->
+                <div class="editor-container" id="editor-container">
+                    <div class="editor-loading" id="editor-loading">
+                        <div class="spinner"></div>
+                        <p>Loading CodeForge Editor…</p>
+                    </div>
+                    <!-- Fallback textarea if Monaco is blocked or CDN fails -->
+                    <textarea class="editor-fallback" id="editor-fallback" aria-label="Source code editor" spellcheck="false" hidden></textarea>
+                </div>
+            </section>
+
+            <!-- Horizontal gutter -->
+            <div class="gutter gutter--horizontal" id="gutter-h" role="separator" aria-label="Resize editor and output" tabindex="0"></div>
+
+            <!-- Output section (Tabs + Testcases + Console + Stderr + Details) -->
+            <section class="output-section" id="output-section">
+
+                <!-- Output tabs header -->
+                <div class="output-tabs" id="output-tabs" role="tablist">
+                    <button class="output-tab active" data-tab="testcases" role="tab" aria-selected="true" aria-controls="pane-testcases" id="tab-testcases">
+                        <span class="tab-icon">🧪</span> Testcases
+                    </button>
+                    <button class="output-tab" data-tab="stdout" role="tab" aria-selected="false" aria-controls="pane-stdout" id="tab-stdout">
+                        <span class="tab-icon">💻</span> Output
+                    </button>
+                    <button class="output-tab" data-tab="stderr" role="tab" aria-selected="false" aria-controls="pane-stderr" id="tab-stderr">
+                        <span class="tab-icon">⚠️</span> Stderr
+                        <span class="output-tab__badge" id="stderr-badge" hidden>!</span>
+                    </button>
+                    <button class="output-tab" data-tab="details" role="tab" aria-selected="false" aria-controls="pane-details" id="tab-details">
+                        <span class="tab-icon">📊</span> Diagnostics
+                    </button>
+
+                    <div class="output-tabs__spacer"></div>
+
+                    <!-- Output action buttons -->
+                    <button class="btn btn--icon btn--sm" id="btn-copy-output" title="Copy output to clipboard" aria-label="Copy output">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                    <button class="btn btn--icon btn--sm" id="btn-clear-output" title="Clear console output" aria-label="Clear output">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    </button>
+                </div>
+
+                <!-- Banner for verdict: Accepted / Wrong Answer / Error -->
+                <div class="verdict-banner" id="verdict-banner" hidden>
+                    <div class="verdict-icon" id="verdict-icon">✅</div>
+                    <div class="verdict-info">
+                        <div class="verdict-title" id="verdict-title">Accepted</div>
+                        <div class="verdict-subtitle" id="verdict-subtitle">All test cases passed successfully!</div>
+                    </div>
+                    <div class="verdict-metrics" id="verdict-metrics">
+                        <span class="metric-pill" id="verdict-time">⚡ 28 ms</span>
+                        <span class="metric-pill" id="verdict-mem" hidden></span>
+                    </div>
+                </div>
+
+                <!-- Output panes container -->
+                <div class="output-content" id="output-content">
+
+                    <!-- PANE 1: TESTCASES (LeetCode style) -->
+                    <div class="output-pane active" id="pane-testcases" role="tabpanel" aria-labelledby="tab-testcases">
+                        <div class="testcases-container">
+                            <div class="testcase-tab-bar">
+                                <div class="testcase-chips" id="testcase-chips">
+                                    <button class="testcase-chip active" data-index="0">Case 1</button>
+                                    <button class="testcase-chip" data-index="1">Case 2</button>
+                                    <button class="testcase-chip" data-index="2">Case 3</button>
+                                </div>
+                                <button class="btn-add-testcase" id="btn-add-testcase" title="Add custom test case">+ Add</button>
+                            </div>
+
+                            <div class="testcase-editor">
+                                <div class="testcase-field">
+                                    <label class="field-label" for="testcase-stdin">Input (stdin):</label>
+                                    <textarea class="testcase-input" id="testcase-stdin" placeholder="Enter input passed to stdin…" rows="2" spellcheck="false"></textarea>
+                                </div>
+                                <div class="testcase-field">
+                                    <label class="field-label" for="testcase-expected">Expected Output (optional):</label>
+                                    <textarea class="testcase-input testcase-input--expected" id="testcase-expected" placeholder="Expected result to compare against…" rows="1" spellcheck="false"></textarea>
+                                </div>
+                            </div>
+
+                            <!-- Suite Results List (when Run All is clicked) -->
+                            <div class="testcase-results" id="testcase-suite-results" hidden>
+                                <div class="suite-title">Test Suite Results:</div>
+                                <div class="suite-items" id="suite-items-container"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- PANE 2: STDOUT CONSOLE -->
+                    <div class="output-pane" id="pane-stdout" role="tabpanel" aria-labelledby="tab-stdout" hidden>
+                        <pre class="output-pre" id="output-stdout"><span class="output-placeholder">Output will appear here after you run your code…</span></pre>
+                    </div>
+
+                    <!-- PANE 3: STDERR -->
+                    <div class="output-pane" id="pane-stderr" role="tabpanel" aria-labelledby="tab-stderr" hidden>
+                        <pre class="output-pre output-pre--error" id="output-stderr"><span class="output-placeholder">No errors reported.</span></pre>
+                    </div>
+
+                    <!-- PANE 4: DIAGNOSTICS & DETAILS -->
+                    <div class="output-pane" id="pane-details" role="tabpanel" aria-labelledby="tab-details" hidden>
+                        <div class="details-grid" id="output-details">
+                            <span class="output-placeholder">Run code to see sandbox process telemetry &amp; resource consumption.</span>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- ========== STATUS BAR ========== -->
+    <footer class="statusbar" id="statusbar">
+        <div class="statusbar__left">
+            <span class="status-dot status-dot--ready" id="status-dot"></span>
+            <span class="status-text" id="status-text">Ready</span>
+        </div>
+        <div class="statusbar__center">
+            <span class="statusbar__badge-item" id="status-lang">Python 3</span>
+            <span class="statusbar__badge-item statusbar__badge-item--active" id="status-problem-title">Two Sum</span>
+        </div>
+        <div class="statusbar__right">
+            <span id="status-cursor">Ln 1, Col 1</span>
+            <span class="statusbar__sep">│</span>
+            <span id="status-exec-time"></span>
+            <span class="statusbar__sep">│</span>
+            <span id="editor-mode">Plain text editor</span>
+            <span class="engine-tag" id="status-engine">Checking engine</span>
+        </div>
+    </footer>
+
+    <!-- ========== KEYBOARD SHORTCUTS MODAL ========== -->
+    <div class="modal-backdrop" id="modal-shortcuts" hidden>
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 class="modal-title">⚡ Keyboard Shortcuts</h3>
+                <button class="btn btn--icon" id="btn-close-modal" aria-label="Close modal">✕</button>
+            </div>
+            <div class="modal-body">
+                <table class="shortcuts-table">
+                    <tr><td><kbd>Ctrl</kbd> + <kbd>Enter</kbd></td><td>Run active test case</td></tr>
+                    <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Enter</kbd></td><td>Run all test cases (Submit)</td></tr>
+                    <tr><td><kbd>Ctrl</kbd> + <kbd>L</kbd></td><td>Clear output console</td></tr>
+                    <tr><td><kbd>Ctrl</kbd> + <kbd>=</kbd> / <kbd>-</kbd></td><td>Increase / decrease font size</td></tr>
+                    <tr><td><kbd>Ctrl</kbd> + <kbd>S</kbd></td><td>Prevent accidental save &amp; quick run</td></tr>
+                    <tr><td><kbd>Esc</kbd></td><td>Close dialogs &amp; clear overlays</td></tr>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+    <dialog class="access-dialog" id="modal-access" aria-labelledby="access-title">
+        <form id="access-form">
+            <div class="modal-header"><h2 id="access-title">Connect to your engine</h2><button type="button" class="btn btn--ghost" id="btn-close-access" aria-label="Close access dialog">×</button></div>
+            <div class="modal-body">
+                <p id="access-status">Add a token if your engine requires authentication.</p>
+                <label for="api-token">API token</label>
+                <input id="api-token" type="password" autocomplete="off" placeholder="Paste your API token" required>
+                <p class="access-note">Kept in this browser tab’s session only. Never included in source code or submissions.</p>
+                <div class="access-actions"><button type="button" id="btn-disconnect" class="btn btn--ghost" hidden>Disconnect</button><button class="btn btn--submit" type="submit">Connect</button></div>
+            </div>
+        </form>
+    </dialog>
+    <script src="/js/app.js"></script>
+</body>
+</html>

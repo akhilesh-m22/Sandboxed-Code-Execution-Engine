@@ -2,15 +2,14 @@
 # ---------------------------------------------------------------------------
 # Static pre-checks ("lint" for malicious submissions).
 #
-# WHY: Runtime sandboxing (rlimits, timeouts) is the primary defence, but a
-# cheap static scan lets us reject trivially dangerous submissions *before*
-# they ever consume a worker or touch the filesystem. This is defence in
-# depth, NOT the security boundary itself.
+# Cheap filters reject obvious misuse before execution. They run in workers
+# and are defense in depth, NOT a security boundary. Docker is the optional
+# OS isolation layer; rlimits and timeouts only constrain resource use.
 #
 # LIMITATION: substring/pattern matching is trivially bypassable by anyone
 # who can obfuscate text (e.g. `getattr(os, "system")`, string concatenation,
 # codecs decode, ...). Always treat this as a convenience filter and rely on
-# the process-level sandbox for real protection.
+# an OS isolation backend when running untrusted code.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from typing import Tuple
 
 # Python risk signals. We look for the *source text* of dangerous symbols/
 # imports and for indirection primitives that make static analysis NULL.
-PY_BLOCKLIST_PATTERNS: tuple[str, str] = (
+PY_BLOCKLIST_PATTERNS: Tuple[str, ...] = (
     # Process / OS escapes
     "os.system",
     "system(",
@@ -63,13 +62,11 @@ PY_BLOCKLIST_PATTERNS: tuple[str, str] = (
 )
 
 # ---------------------------------------------------------------------------
-# NOTE on C: because every C submission is compiled with `-fsyntax-only` and
-# `-Werror`, the *compiler itself* becomes our static filter: calling an
-# undeclared function (system, fork, exec*, socket, ...) is a compile error.
-# We still do a light text sniff so the API can reject the submission before
-# burning compiler time, but the compiler is the authoritative check.
+# C compiler warnings catch mistakes, not arbitrary syscalls. The source
+# filter catches only obvious patterns; headers and direct syscalls can
+# bypass it. Filesystem/network isolation requires the Docker backend.
 # ---------------------------------------------------------------------------
-C_BLOCKLIST_PATTERNS: tuple[str, str] = (
+C_BLOCKLIST_PATTERNS: Tuple[str, ...] = (
     "system(",
     "fork",
     "vfork",

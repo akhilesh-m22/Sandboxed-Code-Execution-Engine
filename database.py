@@ -1,217 +1,137 @@
-# database.py
-# Thin, direct SQLite access layer shared by the API process, the worker
-# processes and the coordinator. Uses one connection per call (short-lived),
-# which sidesteps most cross-process locking headaches; WAL mode further
-# reduces reader/writer contention.
-
+"""SQLite durable queue: atomic capacity/claims and expiring worker leases."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import json
 import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import config
 
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-# We deliberately keep stdout/stderr in the DB (NOT on disk as temp files):
-#   * subprocess pipes already hold them in memory, so persisting is trivial
-#   * files on disk would need per-submission cleanup plus permission juggling
-# Downside: very large outputs bloat the DB; we cap with MAX_RESULT_BYTES.
-# ---------------------------------------------------------------------------
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS submissions (
-    id           TEXT PRIMARY KEY,
-    language     TEXT    NOT NULL,
-    code         TEXT    NOT NULL,
-    stdin        TEXT    DEFAULT '',
-    submitted_at REAL    NOT NULL,       -- epoch seconds (wall)
-    status       TEXT    NOT NULL,       -- queued|running|completed|failed
-    stdout       TEXT    DEFAULT '',
-    stderr       TEXT    DEFAULT '',
-    exit_code    INTEGER,
-    created_at   REAL,
-    executor_pid INTEGER,                -- pid of the worker that claimed it
-    started_at   REAL,                   -- when execution began
-    resource_usage TEXT                  -- JSON: {"wall_time": ..., ...}
+    id TEXT PRIMARY KEY, language TEXT NOT NULL, code TEXT NOT NULL,
+    stdin TEXT DEFAULT '', submitted_at REAL NOT NULL, status TEXT NOT NULL,
+    stdout TEXT DEFAULT '', stderr TEXT DEFAULT '', exit_code INTEGER,
+    created_at REAL, executor_pid TEXT, started_at REAL, resource_usage TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_submissions_status
-    ON submissions(status, submitted_at);
+CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status, submitted_at);
+CREATE TABLE IF NOT EXISTS workers (name TEXT PRIMARY KEY, heartbeat_at REAL NOT NULL);
 """
 
 
-def _init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(_SCHEMA)
-    conn.commit()
+class QueueFull(Exception):
+    """The bounded execution queue has reached capacity."""
 
 
-def _connect() -> sqlite3.Connection:
-    db_path: Path = Path(config.DB_PATH)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=config.SQLITE_TIMEOUT)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    _init_db(conn)
-    return conn
+@contextmanager
+def _connect():
+    path = Path(config.DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=config.SQLITE_TIMEOUT)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(_SCHEMA)
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Queries
-# ---------------------------------------------------------------------------
-
-def gen_submission_id() -> str:
-    """Short, URL-safe, unguessable id (uuid4 hex cut to 16 chars)."""
-    return uuid.uuid4().hex[:16]
+def gen_submission_id():
+    return uuid.uuid4().hex
 
 
-def create_submission(language: str, code: str, stdin: str = "") -> str:
-    """Insert a queued submission; returns its id."""
-    sub_id = gen_submission_id()
+def create_submission(language, code, stdin=""):
+    sub_id, now = gen_submission_id(), time.time()
     with _connect() as conn:
-        conn.execute(
-            "INSERT INTO submissions (id, language, code, stdin, submitted_at, status) "
-            "VALUES (?, ?, ?, ?, ?, 'queued')",
-            (sub_id, language, code[: config.MAX_CODE_BYTES], stdin, time.time()),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        count = conn.execute("SELECT COUNT(*) FROM submissions WHERE status IN ('queued', 'running')").fetchone()[0]
+        if count >= config.MAX_PENDING_JOBS:
+            raise QueueFull("Execution queue is full")
+        conn.execute("INSERT INTO submissions (id, language, code, stdin, submitted_at, status, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+                     (sub_id, language, code, stdin, now, now))
     return sub_id
 
 
-def claim_next(worker_name: str) -> Optional[Dict]:
-    """Claim the oldest queued submission for this worker (best-effort).
-
-    Uses SQLite's RETURNING clause so the "pick + mark-running + hand back"
-    happens in ONE atomic statement: two workers can never claim the same
-    row. Falls back to a BEGIN IMMEDIATE two-step for old SQLite builds.
-    """
-    now = time.time()
-    stmt = """
-        UPDATE submissions
-           SET status = 'running', executor_pid = ?, started_at = ?
-         WHERE id = (
-             SELECT id FROM submissions
-              WHERE status = 'queued'
-              ORDER BY submitted_at, rowid
-              LIMIT 1
-         )
-        RETURNING id, language, code, stdin
-    """
+def claim_next(worker_name):
     with _connect() as conn:
-        try:
-            row = conn.execute(stmt, (worker_name, now)).fetchone()
-            return dict(row) if row else None
-        except sqlite3.OperationalError:
-            # Older SQLite: lock the queue, pick, update, release.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    "SELECT id, language, code, stdin FROM submissions "
-                    "WHERE status = 'queued' "
-                    "ORDER BY submitted_at, rowid LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    conn.execute("COMMIT")
-                    return None
-                conn.execute(
-                    "UPDATE submissions SET status='running', executor_pid=?, "
-                    "started_at=? WHERE id = ?",
-                    (worker_name, now, row["id"]),
-                )
-                conn.execute("COMMIT")
-                return dict(row)
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT id, language, code, stdin FROM submissions WHERE status='queued' ORDER BY submitted_at, rowid LIMIT 1").fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE submissions SET status='running', executor_pid=?, started_at=? WHERE id=?", (worker_name, time.time(), row['id']))
+        return dict(row)
 
 
-def fetch(id_: str) -> Optional[Dict]:
-    """Return a single submission row (or None)."""
+def fetch(id_):
     with _connect() as conn:
-        row = conn.execute("SELECT * FROM submissions WHERE id = ?", (id_,)).fetchone()
+        row = conn.execute("SELECT * FROM submissions WHERE id=?", (id_,)).fetchone()
         return dict(row) if row else None
 
 
-def list_recent(limit: int = 20) -> List[Dict]:
-    """Latest submissions, oldest-first among the newest `limit`."""
+def list_recent(limit=20):
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, language, status, submitted_at FROM submissions "
-            "ORDER BY submitted_at DESC, rowid DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(row) for row in conn.execute("SELECT id, language, status, submitted_at FROM submissions ORDER BY submitted_at DESC, rowid DESC LIMIT ?", (limit,))]
 
 
-# ---------------------------------------------------------------------------
-# Writes
-# ---------------------------------------------------------------------------
+def _trim(value, limit):
+    return (value or "").encode("utf-8", errors="replace")[:limit].decode("utf-8", errors="ignore")
 
-def mark_failed(id_: str, reason: str) -> None:
-    """Set status=failed (crash / infra error), persisting what we know."""
+
+def mark_failed(id_, reason, worker_name=None):
     with _connect() as conn:
-        conn.execute(
-            "UPDATE submissions SET status='failed', stderr=?, exit_code=-1 "
-            "WHERE id = ?",
-            (reason[: config.MAX_RESULT_BYTES], id_),
-        )
+        conn.execute("UPDATE submissions SET status='failed', stderr=?, exit_code=-1 WHERE id=? AND (? IS NULL OR (status='running' AND executor_pid=?))", (_trim(reason, config.MAX_RESULT_BYTES), id_, worker_name, worker_name))
 
 
-def store_result(id_: str, result: Dict) -> None:
-    """Persist a completed (or timed-out) execution result."""
-    stdout = (result.get("stdout") or "").encode("utf-8", errors="replace")[
-        : config.MAX_RESULT_BYTES
-    ].decode("utf-8", errors="replace")
-    stderr = (result.get("stderr") or "").encode("utf-8", errors="replace")[
-        : config.MAX_RESULT_BYTES
-    ].decode("utf-8", errors="replace")
-
-    import json as _json
-
-    usage = _json.dumps(
-        {
-            "wall_time": result.get("wall_time"),
-            "timed_out": bool(result.get("timed_out")),
-        }
-    )
+def store_result(id_, result, worker_name=None):
+    stdout = _trim(result.get("stdout"), config.MAX_RESULT_BYTES)
+    stderr = _trim(result.get("stderr"), max(0, config.MAX_RESULT_BYTES - len(stdout.encode())))
+    usage = json.dumps({"wall_time": result.get("wall_time"), "timed_out": bool(result.get("timed_out")), "output_truncated": bool(result.get("output_truncated"))})
     with _connect() as conn:
-        conn.execute(
-            """
-            UPDATE submissions
-               SET status = 'completed',
-                   stdout = ?,
-                   stderr = ?,
-                   exit_code = ?,
-                   resource_usage = ?
-             WHERE id = ?
-            """,
-            (stdout, stderr, int(result.get("exit_code", -1)), usage, id_),
-        )
+        conn.execute("UPDATE submissions SET status='completed', stdout=?, stderr=?, exit_code=?, resource_usage=? WHERE id=? AND (? IS NULL OR (status='running' AND executor_pid=?))", (stdout, stderr, int(result.get("exit_code", -1)), usage, id_, worker_name, worker_name))
 
 
-# ---------------------------------------------------------------------------
-# Maintenance
-# ---------------------------------------------------------------------------
-
-def requeue_stuck() -> int:
-    """Mark 'running' rows leftover from a crashed worker (pid no longer ours)
-    back to 'queued' so a fresh worker can retry them."""
-    # A worker writes its name (pid) into executor_pid. On startup we sweep
-    # anything 'running' that isn't owned by a currently-alive worker.
-    alive = 0
+def heartbeat(worker_name):
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id FROM submissions WHERE status = 'running'"
-        ).fetchall()
-        for r in rows:
-            conn.execute(
-                "UPDATE submissions SET status='queued', executor_pid=NULL "
-                "WHERE id = ?",
-                (r["id"],),
-            )
-            alive += 1
-    return alive
+        conn.execute("INSERT INTO workers(name, heartbeat_at) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET heartbeat_at=excluded.heartbeat_at", (worker_name, time.time()))
+
+
+def expire_worker(worker_name):
+    with _connect() as conn:
+        conn.execute("UPDATE workers SET heartbeat_at=0 WHERE name=?", (worker_name,))
+
+
+def worker_health():
+    cutoff = time.time() - config.WORKER_STALE_SECONDS
+    with _connect() as conn:
+        workers = conn.execute("SELECT heartbeat_at FROM workers").fetchall()
+        counts = dict(conn.execute("SELECT status, COUNT(*) FROM submissions GROUP BY status").fetchall())
+    active = sum(row[0] >= cutoff for row in workers)
+    return {"ready": active > 0, "active_workers": active, "stale_workers": len(workers) - active,
+            "last_heartbeat_at": max((row[0] for row in workers), default=None),
+            "queued": counts.get("queued", 0), "running": counts.get("running", 0)}
+
+
+def requeue_stuck():
+    """Recover expired leases; live workers are never reset by another pool."""
+    cutoff = time.time() - config.WORKER_STALE_SECONDS
+    with _connect() as conn:
+        cursor = conn.execute("""UPDATE submissions SET status='queued', executor_pid=NULL, started_at=NULL
+            WHERE status='running' AND (
+                executor_pid IN (SELECT name FROM workers WHERE heartbeat_at < ?)
+                OR (started_at < ? AND NOT EXISTS (SELECT 1 FROM workers WHERE name=submissions.executor_pid))
+            )""", (cutoff, cutoff))
+        return cursor.rowcount
+
+
+def prune_results():
+    """Delete finished history older than retention; SQLite reuses freed pages."""
+    with _connect() as conn:
+        count = conn.execute("DELETE FROM submissions WHERE status IN ('completed','failed') AND submitted_at < ?", (time.time() - config.RESULT_RETENTION_SECONDS,)).rowcount
+        conn.execute("DELETE FROM workers WHERE heartbeat_at < ? AND name NOT IN (SELECT executor_pid FROM submissions WHERE executor_pid IS NOT NULL AND status='running')", (time.time() - config.WORKER_STALE_SECONDS,))
+        return count

@@ -81,7 +81,8 @@ def test_busy_wait_with_output_times_out():
     r = sandbox.run_code(
         "python", "while True:\n    print('y' * 1024)", timeout=1.0
     )
-    assert r["timed_out"] is True
+    assert r["timed_out"] or r["output_truncated"]
+    assert len(r["stdout"].encode()) + len(r["stderr"].encode()) <= 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Attack 3: reading files OUTSIDE the temp workdir.
@@ -193,7 +194,7 @@ def test_metaprogramming_indirection_blocked(source):
 def test_c_hello_world_missing_compiler_is_graceful_or_succeeds():
     # On CI with gcc this runs; on a laptop without a compiler the engine
     # must degrade to a clean failure result -- never a raise.
-    r = sandbox.run_code("c", "int main(void){printf(\"hi\\n\");return 0;}")
+    r = sandbox.run_code("c", "#include <stdio.h>\nint main(void){printf(\"hi\\n\");return 0;}")
     assert "exit_code" in r
     if "no C compiler" not in r["stderr"]:
         assert r["exit_code"] == 0
